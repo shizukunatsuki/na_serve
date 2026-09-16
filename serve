@@ -1,5 +1,6 @@
 #!/bin/zsh -f
-# ---------------- serve: temporary HTTP file server + public tunnel ----------------
+# serve: temporary HTTP file server + public tunnel
+#
 # Serve the current directory with Caddy on a kernel-assigned port (LAN) and a
 # cloudflared quick tunnel (public). Ctrl-C stops both. Signals are only ever
 # sent to our own process group, so nothing outside `serve` can be killed by
@@ -76,8 +77,8 @@ for i in {1..100}; do
 done
 
 if (( stop )); then
-  # Interrupted during startup: the terminal's SIGINT also reached caddy
-  # directly, so its state says nothing, and nothing else gets started
+  # Interrupted during startup: the same signal also reached caddy directly,
+  # so its state says nothing, and nothing else gets started
   :
 elif ! kill -0 $caddy_pid 2>/dev/null; then
   print -u2 "serve: caddy failed to start"

@@ -35,9 +35,12 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVE = os.path.join(ROOT, 'serve')
 ANSI = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
-LOCAL_URL_RE = re.compile(r'Local: http://([^:/]+)\.local:(\d+)/')
 TUNNEL_URL_RE = re.compile(r'https://[a-z0-9-]+\.trycloudflare\.com')
 HOST = subprocess.run(['scutil', '--get', 'LocalHostName'], capture_output=True).stdout.decode().strip()
+# What the Local: line must name: the Bonjour name, or localhost (with a note
+# saying why) on a machine that has no LocalHostName set
+EXPECTED_HOST = f'{HOST}.local' if HOST else 'localhost'
+LOCAL_URL_RE = re.compile(rf'Local: http://({re.escape(EXPECTED_HOST)}):(\d+)/')
 
 REAL_TUNNEL = False  # set from argv in main()
 
@@ -52,13 +55,10 @@ class Shell:
     the test gets to read it.
     """
 
-    def __init__(self, env_extra=None):
+    def __init__(self):
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
-            env = dict(os.environ)
-            env['TERM'] = 'xterm-256color'
-            if env_extra:
-                env.update(env_extra)
+            env = dict(os.environ, TERM='xterm-256color')
             os.execvpe('zsh', ['zsh', '-f', '-i'], env)
         os.set_inheritable(self.fd, False)  # never leak into a later pty.fork()
         SHELL_PIDS.append(self.pid)
@@ -308,8 +308,8 @@ WS = None  # set in main()
 def cf_path(behavior='sleep'):
     """PATH prefix with a real caddy and a substitute cloudflared.
 
-    `behavior`: 'sleep' (default, harmless placeholder), 'ignore-signals', or
-    'missing' (caddy only, no cloudflared at all).
+    `behavior`: 'sleep' (default: echoes its arguments, then sleeps),
+    'ignore-signals', or 'missing' (caddy only, no cloudflared at all).
     """
     if behavior == 'missing':
         return WS.stub_dir('caddy-only', {'caddy': None})
@@ -318,9 +318,9 @@ def cf_path(behavior='sleep'):
 
 
 def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, path_mode='prefix'):
-    """cd into a per-scenario site dir, start a decoy
-    background job (a sleep whose 71xx duration tags it as a decoy), then
-    invoke serve. Returns the decoy's PID.
+    """cd into a per-scenario site dir, start a decoy background job (a sleep
+    whose 71xx duration tags it as a decoy), then invoke serve. Returns the
+    decoy's PID.
 
     `path_mode` decides how the stub directory relates to the real PATH:
       'prefix'  prepend it, so a stub shadows the real binary of that name
@@ -350,6 +350,12 @@ def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, pat
 def exit_code(sh):
     m = re.findall(r'EXIT=(\d+)', sh.text())
     return int(m[-1]) if m else None
+
+
+def serve_output(sh):
+    """Only what serve itself produced: the transcript after the echo of the
+    invocation line, which ends in the literal `EXIT=$?`."""
+    return sh.text().rsplit('EXIT=$?', 1)[-1]
 
 
 def local_port(sh):
@@ -434,15 +440,14 @@ def single_instance():
     checks = {
         'red serving line names the right directory': f'Serving: {WS.site("A")}' in t,
         'red serving line is actually bold red': b'\x1b[1;31mServing: ' in sh.raw_bytes(),
-        'lan hostname correct': bool(LOCAL_URL_RE.search(t)) and LOCAL_URL_RE.search(t).group(1) == HOST,
+        'local url names this machine': bool(LOCAL_URL_RE.search(t))
+                                         and (bool(HOST) or '(LocalHostName is not set' in t),
         'port in ephemeral range': bool(port) and 49152 <= port <= 65535,
     }
-    if not HOST:   # no LocalHostName on this machine: the line must say so instead of "http://.local"
-        checks['lan hostname correct'] = f'Local: http://localhost:{port}/ (LocalHostName is not set' in t
     time.sleep(0.3)
     checks['serves over 127.0.0.1'] = get('A', port, '127.0.0.1') is True
     checks['serves over ::1'] = get('A', port, '[::1]') is True
-    checks['serves over .local hostname'] = get('A', port, f'{HOST}.local') is True
+    checks['serves over the local url host'] = get('A', port, EXPECTED_HOST) is True
     try:
         checks['directory listing shows the file'] = 'who.txt' in http_get(f'http://localhost:{port}/')
     except Exception as e:
@@ -527,10 +532,10 @@ def triple_ctrl_c():
 
 @scenario
 def ctrl_backslash():
-    # Ctrl-\ sends SIGQUIT to the foreground group. Untrapped, it ended the
-    # supervising subshell before any cleanup ran; caddy happens to quit on
-    # SIGQUIT by itself, but anything that ignores it (the stub does, and
-    # background jobs inherit SIGQUIT ignored) was left behind.
+    # Ctrl-\ sends SIGQUIT to the foreground group. Untrapped, it ended serve
+    # before any cleanup ran; caddy happens to quit on SIGQUIT by itself, but
+    # anything that ignores it (the stub does, and background jobs inherit
+    # SIGQUIT ignored) was left behind.
     sh = Shell()
     decoy = start_serve(sh, 'A')
     sh.wait('Local: http://', 10)
@@ -558,7 +563,7 @@ def ctrl_c_during_startup():
     wait_until(lambda: our_pids(name='caddy'))   # serve is under way; race its port read
     sh.send('\x03', settle=0.0)
     sh.wait(r'EXIT=\d+', 15)
-    t = sh.text().split('serve; print')[-1]
+    t = serve_output(sh)
     ec = exit_code(sh)
     sh.finish()
     time.sleep(0.5)
@@ -602,9 +607,9 @@ def caddy_exits_immediately():
     sh = Shell()
     decoy = start_serve(sh, 'A', path_prefix=WS.stub_dir('caddy-exit1', {'caddy': WS.STUB_EXIT_1, 'cloudflared': None}))
     sh.wait(r'EXIT=\d+', 15)
-    t = sh.text()
+    t = serve_output(sh)
     ec = exit_code(sh)
-    ok = ec == 1 and 'serve: caddy failed to start' in t and 'cloudflared' not in t.split('serve; print')[-1]
+    ok = ec == 1 and 'serve: caddy failed to start' in t and 'cloudflared' not in t
     sh.finish()
     time.sleep(0.5)
     ok = ok and not no_orphans() and alive(decoy) is True
@@ -767,23 +772,31 @@ def helper_misbehaves_at_run_time():
             'exit': ec,
             'refused with an accurate message': 'serve: could not read the port caddy is listening on' in t,
             'cloudflared never started': 'CF_INVOKED_WITH' not in t,
+            'no zsh warning leaked': 'truncated' not in t,
             'nothing left running': not no_orphans(),
             'decoy untouched': alive(decoy) is True,
         }
         reap(our_pids(pattern=DECOY_PATTERN))
     failed = {k: v for k, v in results.items()
               if not (v['exit'] == 1 and v['refused with an accurate message']
-                      and v['cloudflared never started'] and v['nothing left running']
-                      and v['decoy untouched'])}
+                      and v['cloudflared never started'] and v['no zsh warning leaked']
+                      and v['nothing left running'] and v['decoy untouched'])}
     record('a helper that exists but misbehaves never reaches the tunnel URL', not failed, failed)
 
 
 @scenario
 def refuses_without_a_tty():
-    p = subprocess.run(
+    # Not a pty shell, so it is registered by hand for the ownership sampler:
+    # otherwise a caddy started here would never be recognised as ours
+    p = subprocess.Popen(
         ['zsh', '-c', f'cd "{WS.site("A")}"; "{SERVE}"; print EXIT=$?'],
-        stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
-    out = p.stdout.decode() + p.stderr.decode()
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    SHELL_PIDS.append(p.pid)
+    try:
+        out = p.communicate(timeout=20)[0].decode()
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out = p.communicate()[0].decode()
     ok = 'refusing to start' in out and 'EXIT=1' in out and not no_orphans()
     record('refuses to start with no controlling terminal', ok, {'output': out.strip()})
 
