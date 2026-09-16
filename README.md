@@ -12,11 +12,11 @@ brew install caddy cloudflared
 
 ## 安装
 
-[`serve`](serve) 是一个独立脚本（`#!/bin/zsh -f`，用 macOS 自带的 zsh），软链到
-PATH 里的任意目录即可，不依赖你的交互 shell 是什么：
+[`serve`](serve) 是一个独立脚本（`#!/bin/zsh -f`，用 macOS 自带的 zsh），不依赖你的
+交互 shell 是什么。在 `~/.zshrc` 里加一个 alias 指向它即可：
 
 ```bash
-ln -s "$PWD/serve" ~/.local/bin/serve
+alias serve=/path/to/na_serve/serve
 ```
 
 ## 用法
