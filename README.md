@@ -1,6 +1,6 @@
 # na_serve
 
-一个 zsh 函数：用 [Caddy](https://caddyserver.com/) 把当前目录发布到局域网，同时用
+一个 zsh 脚本：用 [Caddy](https://caddyserver.com/) 把当前目录发布到局域网，同时用
 [cloudflared](https://github.com/cloudflare/cloudflared) 开一条临时公网隧道，替代
 `python3 -m http.server`。仅支持 macOS。
 
@@ -12,10 +12,11 @@ brew install caddy cloudflared
 
 ## 安装
 
-把 [`serve.zsh`](serve.zsh) 里的函数复制进 `~/.zshrc`，或者直接 source 它：
+[`serve`](serve) 是一个独立脚本（`#!/bin/zsh -f`，用 macOS 自带的 zsh），软链到
+PATH 里的任意目录即可，不依赖你的交互 shell 是什么：
 
 ```bash
-echo 'source /path/to/na_serve/serve.zsh' >> ~/.zshrc
+ln -s "$PWD/serve" ~/.local/bin/serve
 ```
 
 ## 用法
@@ -48,8 +49,10 @@ Local: http://your-mac.local:61234/
 - **读到的端口会被校验**：`lsof` 的输出由 zsh 自己解析，只有 1–65535 的整数会被接受。
   `lsof` 损坏或被劫持时，它的输出不会被拼进 URL 交给 cloudflared，而是当作"读不到端口"
   处理并退出。
-- **生命周期不变量**：所有清理信号只发给 `serve` 自己的进程组（`kill -SIG -$pgid`），
-  且只在该组的组长存活时发送。`kill -0` 只用来探测进程是否存活，从不用来发送信号。
+- **生命周期不变量**：所有清理信号只发给 `serve` 自己的进程组（`kill -SIG -$$`），
+  且只在该组的组长存活时发送。调用它的交互 shell 会把脚本作为前台 job 放进独立的
+  进程组，脚本内部不开 job control，caddy 和 cloudflared 因此留在同一个组里；
+  不是组长时（例如没有终端）拒绝启动。`kill -0` 只用来探测进程是否存活，从不用来发送信号。
   这样即使某个 PID 在极端情况下被系统回收复用，也不会误杀到无关进程。
 - Ctrl-C、Ctrl-\、关闭终端（HUP）、父 shell 被杀、`Ctrl-Z` 后父 shell 被杀，都会在几秒内
   干净地停掉 Caddy 和 cloudflared；任何一个服务自己崩溃也会带着另一个一起收尾。
@@ -62,8 +65,8 @@ Local: http://your-mac.local:61234/
 
 ## 已知限制
 
-- 运行 `serve` 的那个子 shell 本身如果被 `SIGKILL`，Caddy 和 cloudflared 不会被自动
-  收尾——这是外部对这个 shell 本身动手，不是 `serve` 能在 shell 层面兜住的场景。
+- `serve` 进程本身如果被 `SIGKILL`，Caddy 和 cloudflared 不会被自动收尾——这是外部
+  对 supervisor 本身动手，不是 `serve` 能在 shell 层面兜住的场景。
 - 如果机器的 `LocalHostName` 没设置，就没有 `.local` 名字可打印；`Local:` 那行会退化成
   `http://localhost:PORT/` 并注明原因，服务本身照常运行。
 

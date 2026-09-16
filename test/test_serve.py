@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end tests for `serve` (../serve.zsh) against real caddy and cloudflared
+"""End-to-end tests for `serve` (../serve) against real caddy and cloudflared
 binaries, driven through an interactive zsh on a real pseudo-terminal.
 
 Every scenario checks two things after it ends, regardless of what else it
@@ -33,7 +33,7 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SERVE = os.path.join(ROOT, 'serve.zsh')
+SERVE = os.path.join(ROOT, 'serve')
 ANSI = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
 LOCAL_URL_RE = re.compile(r'Local: http://([^:/]+)\.local:(\d+)/')
 TUNNEL_URL_RE = re.compile(r'https://[a-z0-9-]+\.trycloudflare\.com')
@@ -169,7 +169,7 @@ def our_pids(name=None, pattern=None):
 
     The machine may well be running the user's own serve, or another caddy
     entirely. Treating those as leaked test processes would report phantom
-    failures, and killing them would be exactly the mistake serve.zsh itself
+    failures, and killing them would be exactly the mistake serve itself
     is built to never make.
     """
     found = pids_exact(name) if name else pids_matching(pattern)
@@ -241,7 +241,7 @@ def reap(pids):
             pass
 
 
-# Every command serve.zsh shells out to; its pre-flight check must cover all of them
+# Every command serve shells out to; its pre-flight check must cover all of them
 REQUIRED_COMMANDS = ('caddy', 'cloudflared', 'scutil', 'ps', 'lsof')
 
 
@@ -318,7 +318,7 @@ def cf_path(behavior='sleep'):
 
 
 def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, path_mode='prefix'):
-    """Source serve.zsh, cd into a per-scenario site dir, start a decoy
+    """cd into a per-scenario site dir, start a decoy
     background job (a sleep whose 71xx duration tags it as a decoy), then
     invoke serve. Returns the decoy's PID.
 
@@ -339,12 +339,11 @@ def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, pat
             sh.cmd(f'export PATH="{path_prefix}:/usr/bin:/bin:/usr/sbin:/sbin"')
         else:
             sh.cmd(f'export PATH="{path_prefix}:$PATH"')
-    sh.cmd(f'source "{SERVE}"')
     sh.cmd(f'cd "{WS.site(site_letter)}"')
     sh.cmd(f'sleep {decoy_tag} &')
     m = re.search(r'\[\d+\] (\d+)', sh.text()[-200:])
     decoy = m.group(1) if m else None
-    sh.cmd('serve; print EXIT=$?', settle=0.05)
+    sh.cmd(f'"{SERVE}"; print EXIT=$?', settle=0.05)
     return decoy
 
 
@@ -434,7 +433,7 @@ def single_instance():
     port = local_port(sh)
     checks = {
         'red serving line names the right directory': f'Serving: {WS.site("A")}' in t,
-        'red serving line is actually red': b'\x1b[31mServing: ' in sh.raw_bytes(),
+        'red serving line is actually bold red': b'\x1b[1;31mServing: ' in sh.raw_bytes(),
         'lan hostname correct': bool(LOCAL_URL_RE.search(t)) and LOCAL_URL_RE.search(t).group(1) == HOST,
         'port in ephemeral range': bool(port) and 49152 <= port <= 65535,
     }
@@ -782,7 +781,7 @@ def helper_misbehaves_at_run_time():
 @scenario
 def refuses_without_a_tty():
     p = subprocess.run(
-        ['zsh', '-c', f'source "{SERVE}"; cd "{WS.site("A")}"; serve; print EXIT=$?'],
+        ['zsh', '-c', f'cd "{WS.site("A")}"; "{SERVE}"; print EXIT=$?'],
         stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
     out = p.stdout.decode() + p.stderr.decode()
     ok = 'refusing to start' in out and 'EXIT=1' in out and not no_orphans()
@@ -825,7 +824,7 @@ def main():
     if REAL_TUNNEL and not shutil.which('cloudflared'):
         sys.exit('cloudflared not found on PATH (brew install cloudflared)')
     if sys.platform != 'darwin':
-        sys.exit('serve.zsh is macOS-only; these tests assume a macOS host')
+        sys.exit('serve is macOS-only; these tests assume a macOS host')
 
     foreign = pids_exact('caddy') + pids_exact('cloudflared')
     if foreign:
