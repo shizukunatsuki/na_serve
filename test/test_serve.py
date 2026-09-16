@@ -61,6 +61,7 @@ class Shell:
                 env.update(env_extra)
             os.execvpe('zsh', ['zsh', '-f', '-i'], env)
         os.set_inheritable(self.fd, False)  # never leak into a later pty.fork()
+        SHELL_PIDS.append(self.pid)
         self._buf = b''
         self._lock = threading.Lock()
         self._closed = False
@@ -117,6 +118,8 @@ class Shell:
                 pass
 
     def kill(self):
+        if self.pid in SHELL_PIDS:
+            SHELL_PIDS.remove(self.pid)   # its pid may be recycled after this
         try:
             os.kill(self.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -134,6 +137,44 @@ class Shell:
 
 
 # --------------------------------------------------------------------- helpers
+
+SHELL_PIDS = []       # pty shells this suite created, while they are alive
+KNOWN_OURS = set()    # every pid ever observed as a descendant of one of them
+
+
+def _descendants(roots):
+    seen, frontier = set(), [str(r) for r in roots]
+    while frontier:
+        out = subprocess.run(['pgrep', '-P', ','.join(frontier)],
+                             capture_output=True).stdout.decode().split()
+        new = [p for p in out if p not in seen]
+        seen.update(new)
+        frontier = new
+    return seen
+
+
+def refresh_ours():
+    """Record everything currently descending from our shells.
+
+    Sampled continuously while a scenario runs, because a process has to be
+    claimed BEFORE its shell is killed: once the shell dies its children are
+    reparented and the tree no longer leads back to us.
+    """
+    SHELL_PIDS[:] = [p for p in SHELL_PIDS if alive(p)]
+    KNOWN_OURS.update(_descendants(SHELL_PIDS))
+
+
+def our_pids(name=None, pattern=None):
+    """Matching processes THIS SUITE started -- never anything else.
+
+    The machine may well be running the user's own serve, or another caddy
+    entirely. Treating those as leaked test processes would report phantom
+    failures, and killing them would be exactly the mistake serve.zsh itself
+    is built to never make.
+    """
+    found = pids_exact(name) if name else pids_matching(pattern)
+    return [p for p in found if p in KNOWN_OURS]
+
 
 def pids_exact(name):
     return subprocess.run(['pgrep', '-x', name], capture_output=True).stdout.decode().split()
@@ -158,17 +199,43 @@ def http_get(url, timeout=5):
     return urllib.request.urlopen(url, timeout=timeout).read().decode()
 
 
+def wait_until(predicate, timeout=8, interval=0.05):
+    """Poll until `predicate` is true. Stub binaries are shell scripts that
+    exec into their real process, so a scenario that inspects or signals one
+    the instant serve launches it can catch /bin/sh instead -- which behaves
+    nothing like the process the scenario means to test."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return False
+
+
+def cf_pids():
+    """Our cloudflared process, whether it is the real binary or a stub."""
+    return our_pids(name='cloudflared') or our_pids(pattern='sleep 7200')
+
+
 def no_orphans(stub_pattern=None):
-    left = pids_exact('caddy') + pids_exact('cloudflared')
+    left = our_pids(name='caddy') + our_pids(name='cloudflared')
     if stub_pattern:
-        left += pids_matching(stub_pattern)
+        left += our_pids(pattern=stub_pattern)
     return left
+
+
+# Every command serve.zsh shells out to; its pre-flight check must cover all of them
+REQUIRED_COMMANDS = ('caddy', 'cloudflared', 'scutil', 'ps', 'lsof', 'sed', 'head')
 
 
 class Workspace:
     """Scratch area for one test run: real site directories, stub binaries."""
 
     STUB_SLEEP = '#!/bin/sh\nexec sleep 7200\n'
+    # Scenarios that replace PATH wholesale leave /bin/sh without a PATH of its
+    # own, so these two spell out where sleep lives instead of looking it up.
+    STUB_SLEEP_ABS = '#!/bin/sh\nexec /bin/sleep 7200\n'
+    STUB_CF_ANNOUNCES = '#!/bin/sh\necho "CF_INVOKED_WITH: $*" >&2\nexec /bin/sleep 7200\n'
     STUB_IGNORES_SIGNALS = (
         '#!/bin/sh\n'
         'exec python3 -c "import signal, time\n'
@@ -236,19 +303,24 @@ def cf_path(behavior='sleep'):
     return WS.stub_dir(f'cf-{behavior}', {'caddy': None, 'cloudflared': body})
 
 
-def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_port=7101, replace_path=False):
+def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_port=7101, path_mode='prefix'):
     """Source serve.zsh, cd into a per-scenario site dir, start a decoy
     background job, then invoke serve. Returns the decoy's PID.
 
-    `path_prefix` is normally prepended to the existing PATH. Pass
-    `replace_path=True` for a stub directory that must HIDE a real binary
-    (e.g. the "cloudflared is missing" scenario) rather than just shadow it:
-    prepending would still leave the real one reachable later on PATH.
+    `path_mode` decides how the stub directory relates to the real PATH:
+      'prefix'  prepend it, so a stub shadows the real binary of that name
+      'system'  the stub directory plus the standard system directories, which
+                HIDES a binary installed elsewhere (e.g. cloudflared under
+                /opt/homebrew/bin) while ordinary tools stay reachable
+      'only'    the stub directory and nothing else, the only way to hide a
+                tool that lives in a system directory (lsof, sed, ps...)
     """
     if path_prefix == 'real-or-stub':
         path_prefix = None if REAL_TUNNEL else cf_path('sleep')
     if path_prefix:
-        if replace_path:
+        if path_mode == 'only':
+            sh.cmd(f'export PATH="{path_prefix}"')
+        elif path_mode == 'system':
             sh.cmd(f'export PATH="{path_prefix}:/usr/bin:/bin:/usr/sbin:/sbin"')
         else:
             sh.cmd(f'export PATH="{path_prefix}:$PATH"')
@@ -307,13 +379,25 @@ def scenario(fn):
     """
     @functools.wraps(fn)
     def wrapped():
+        sampling = True
+
+        def sample():
+            while sampling:
+                refresh_ours()
+                time.sleep(0.1)
+
+        sampler = threading.Thread(target=sample, daemon=True)
+        sampler.start()
         try:
             fn()
         except Exception as e:
             record(fn.__name__, False, repr(e))
         finally:
+            refresh_ours()
+            sampling = False
+            sampler.join(0.5)
             # pgrep on macOS uses POSIX extended regex: no \d shorthand, use [0-9]
-            leftover = no_orphans(r'sleep 720[0-9]') + pids_matching(r'^sleep 71[0-9][0-9]$')
+            leftover = no_orphans(r'sleep 720[0-9]') + our_pids(pattern=r'^sleep 71[0-9][0-9]$')
             for p in leftover:
                 try:
                     os.kill(int(p), signal.SIGTERM)
@@ -347,13 +431,14 @@ def single_instance():
     except Exception as e:
         checks['directory listing shows the file'] = f'ERR {e}'
     cf_args = subprocess.run(
-        ['ps', '-o', 'args=', '-p', ','.join(pids_exact('cloudflared') or ['0'])],
+        ['ps', '-o', 'args=', '-p', ','.join(our_pids(name='cloudflared') or ['0'])],
         capture_output=True).stdout.decode()
     if REAL_TUNNEL:
         checks['tunnel targets localhost, not 127.0.0.1'] = f'--url http://localhost:{port}' in cf_args
         checks['tunnel URL printed'] = bool(tunnel_url(sh))
+    wait_until(lambda: our_pids(name='caddy') and cf_pids())
     pgids = subprocess.run(
-        ['ps', '-o', 'pgid=', '-p', ','.join(pids_exact('caddy') + (pids_exact('cloudflared') or pids_matching('sleep 7200')))],
+        ['ps', '-o', 'pgid=', '-p', ','.join(our_pids(name='caddy') + cf_pids())],
         capture_output=True).stdout.decode().split()
     checks['caddy and cloudflared share one process group'] = len(set(pgids)) == 1 and len(pgids) == 2
     sh.send('\x03')
@@ -432,6 +517,7 @@ def ctrl_c_during_startup():
     # never a false "failed to start", never a leftover process.
     sh = Shell()
     decoy = start_serve(sh, 'A')
+    wait_until(lambda: our_pids(name='caddy'))   # serve is under way; race its port read
     sh.send('\x03', settle=0.0)
     sh.wait(r'EXIT=\d+', 15)
     t = sh.text().split('serve; print')[-1]
@@ -449,7 +535,9 @@ def _service_crashes(which):
     decoy = start_serve(sh, 'A')
     sh.wait('Local: http://', 10)
     time.sleep(1.5)
-    victims = pids_exact(which) if which == 'caddy' else (pids_exact('cloudflared') or pids_matching('sleep 7200'))
+    # only ever the process this scenario started: `which` names a program that
+    # the person running these tests may well have running for real
+    victims = our_pids(name='caddy') if which == 'caddy' else cf_pids()
     for p in victims:
         os.kill(int(p), signal.SIGKILL)
     sh.wait(r'EXIT=\d+', 15)
@@ -493,7 +581,9 @@ def caddy_never_listens():
     sh.wait(r'EXIT=\d+', 20)
     dt = time.time() - t0
     ec = exit_code(sh)
-    msg = 'serve: caddy failed to start' in sh.text()
+    # a live caddy whose port cannot be read is a different failure from a
+    # caddy that died, and has to be reported as its own thing
+    msg = 'serve: could not read the port caddy is listening on' in sh.text()
     sh.finish()
     time.sleep(0.5)
     ok = ec == 1 and msg and 2.5 <= dt <= 6 and not no_orphans(r'sleep 7200') and alive(decoy) is True
@@ -503,7 +593,7 @@ def caddy_never_listens():
 @scenario
 def cloudflared_missing():
     sh = Shell()
-    decoy = start_serve(sh, 'A', path_prefix=cf_path('missing'), replace_path=True)
+    decoy = start_serve(sh, 'A', path_prefix=cf_path('missing'), path_mode='system')
     sh.wait(r'EXIT=\d+', 10)
     ec = exit_code(sh)
     msg = 'serve: cloudflared not found' in sh.text()
@@ -518,7 +608,7 @@ def cloudflared_ignores_signals():
     sh = Shell()
     decoy = start_serve(sh, 'A', path_prefix=cf_path('ignore-signals'))
     sh.wait('Local: http://', 10)
-    time.sleep(1.0)
+    wait_until(lambda: our_pids(pattern=r'time\.sleep\(7200\)'))
     t0 = time.time()
     sh.send('\x03')
     sh.wait(r'EXIT=\d+', 20)
@@ -539,7 +629,7 @@ def _other_instance_survives(kill_how):
     y.wait('Local: http://', 10)
     time.sleep(1.0)
     port_x, port_y = local_port(x), local_port(y)
-    before = {'caddy': len(pids_exact('caddy')), 'stub_cf': len(pids_matching(r'sleep 7200'))}
+    before = {'caddy': len(our_pids(name='caddy')), 'stub_cf': len(our_pids(pattern='sleep 7200'))}
     if kill_how == 'ctrl-z-then-kill':
         x.send('\x1a')
         x.wait('suspended', 5)
@@ -549,7 +639,7 @@ def _other_instance_survives(kill_how):
         os.kill(x.pid, signal.SIGKILL)
     time.sleep(3)
     x.finish()
-    after = {'caddy': len(pids_exact('caddy')), 'stub_cf': len(pids_matching(r'sleep 7200'))}
+    after = {'caddy': len(our_pids(name='caddy')), 'stub_cf': len(our_pids(pattern='sleep 7200'))}
     x_closed = get('A', port_x) is not True
     y_serving = get('B', port_y) is True
     y.send('\x03')
@@ -580,6 +670,84 @@ def ctrl_z_then_sigkill_other_instance_survives():
 
 
 @scenario
+def missing_helper_commands():
+    """Layer 1: every command serve shells out to is checked up front, and the
+    error names the command that is actually missing."""
+    results = {}
+    for missing in ('caddy', 'cloudflared', 'scutil', 'ps', 'lsof', 'sed', 'head'):
+        present = {c: None for c in REQUIRED_COMMANDS if c != missing}
+        if 'cloudflared' in present:
+            present['cloudflared'] = WS.STUB_SLEEP_ABS
+        present['sleep'] = None          # the decoy background job needs it
+        sh = Shell()
+        decoy = start_serve(sh, 'A', path_prefix=WS.stub_dir(f'without-{missing}', present),
+                            path_mode='only')
+        sh.wait(r'EXIT=\d+', 10)
+        t, ec = sh.text(), exit_code(sh)
+        sh.finish()
+        time.sleep(0.4)
+        results[missing] = {
+            'exit': ec,
+            'named the missing command': f'serve: {missing} not found' in t,
+            'nothing left running': not no_orphans(r'sleep 7200'),
+            'decoy untouched': alive(decoy) is True,
+        }
+        for p in our_pids(pattern=r'^sleep 71[0-9][0-9]$'):
+            try:
+                os.kill(int(p), signal.SIGTERM)
+            except (ValueError, ProcessLookupError):
+                pass
+    failed = {k: v for k, v in results.items()
+              if not (v['exit'] == 1 and v['named the missing command']
+                      and v['nothing left running'] and v['decoy untouched'])}
+    record('a missing helper command is refused up front, by name', not failed, failed)
+
+
+@scenario
+def helper_misbehaves_at_run_time():
+    """Layer 2: the pre-flight check only proves a command exists. One that
+    exists but returns nonsense (broken, hijacked, or removed after the check)
+    must never have its output spliced into a URL, and must never leave a
+    service process behind."""
+    cases = {
+        'lsof prints a non-numeric port': ('lsof', '#!/bin/sh\necho "n*:not-a-port"\n'),
+        'lsof prints an out-of-range port': ('lsof', '#!/bin/sh\necho "n*:999999"\n'),
+        'lsof succeeds but reports no listener': ('lsof', '#!/bin/sh\nexit 0\n'),
+        'sed fails every time it runs': ('sed', '#!/bin/sh\necho "sed: broken" >&2\nexit 127\n'),
+    }
+    results = {}
+    for label, (cmd, body) in cases.items():
+        files = {c: None for c in REQUIRED_COMMANDS}
+        files[cmd] = body
+        files['cloudflared'] = WS.STUB_CF_ANNOUNCES
+        files['sleep'] = None            # the decoy background job needs it
+        sh = Shell()
+        decoy = start_serve(sh, 'A', path_prefix=WS.stub_dir(f'broken-{label}', files),
+                            path_mode='only')
+        sh.wait(r'EXIT=\d+', 15)
+        t, ec = sh.text(), exit_code(sh)
+        sh.finish()
+        time.sleep(0.4)
+        results[label] = {
+            'exit': ec,
+            'refused with an accurate message': 'serve: could not read the port caddy is listening on' in t,
+            'cloudflared never started': 'CF_INVOKED_WITH' not in t,
+            'nothing left running': not no_orphans(r'sleep 7200'),
+            'decoy untouched': alive(decoy) is True,
+        }
+        for p in our_pids(pattern=r'^sleep 71[0-9][0-9]$'):
+            try:
+                os.kill(int(p), signal.SIGTERM)
+            except (ValueError, ProcessLookupError):
+                pass
+    failed = {k: v for k, v in results.items()
+              if not (v['exit'] == 1 and v['refused with an accurate message']
+                      and v['cloudflared never started'] and v['nothing left running']
+                      and v['decoy untouched'])}
+    record('a helper that exists but misbehaves never reaches the tunnel URL', not failed, failed)
+
+
+@scenario
 def refuses_without_a_tty():
     p = subprocess.run(
         ['zsh', '-c', f'source "{SERVE}"; cd "{WS.site("A")}"; serve; print EXIT=$?'],
@@ -603,6 +771,8 @@ SCENARIOS = [
     hangup_other_instance_survives,
     sigkill_other_instance_survives,
     ctrl_z_then_sigkill_other_instance_survives,
+    missing_helper_commands,
+    helper_misbehaves_at_run_time,
     refuses_without_a_tty,
 ]
 
@@ -624,8 +794,11 @@ def main():
     if sys.platform != 'darwin':
         sys.exit('serve.zsh is macOS-only; these tests assume a macOS host')
 
-    if no_orphans():
-        sys.exit('a caddy or cloudflared process is already running; stop it before testing')
+    foreign = pids_exact('caddy') + pids_exact('cloudflared')
+    if foreign:
+        print(f'note: {len(foreign)} caddy/cloudflared process(es) already running '
+              f'(pids {" ".join(foreign)}). They are not ours: this suite ignores them '
+              f'and will never signal them.\n')
 
     WS = Workspace()
     try:

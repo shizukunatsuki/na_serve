@@ -10,8 +10,12 @@ serve() {
   (
     zmodload zsh/system zsh/zselect || exit 1
 
+    # Everything serve shells out to. A missing helper is checked here so it
+    # fails with its own name, instead of surfacing later as a symptom that
+    # points at the wrong thing: without lsof the port simply never turns up,
+    # which is indistinguishable from caddy never managing to listen.
     local cmd
-    for cmd in caddy cloudflared; do
+    for cmd in caddy cloudflared scutil ps lsof sed head; do
       if (( ! $+commands[$cmd] )); then
         print -u2 "serve: $cmd not found"
         exit 1
@@ -43,8 +47,11 @@ serve() {
     # Ctrl-C during the poll also hits lsof/sed/head (same process group); the
     # result is then empty and the loop ends through the trap on the next turn.
     for i in {1..30}; do
-      port=$(lsof -nP -a -p $caddy_pid -iTCP -sTCP:LISTEN -Fn 2>/dev/null \
-             | sed -n 's/^n.*:\([0-9]*\)$/\1/p' | head -n 1)
+      port=$( { lsof -nP -a -p $caddy_pid -iTCP -sTCP:LISTEN -Fn \
+                | sed -n 's/^n.*:\([0-9]*\)$/\1/p' | head -n 1 } 2>/dev/null )
+      # Anything but a real TCP port number means the pipeline misbehaved; it
+      # must not reach cloudflared as part of a URL
+      [[ $port == <-> ]] && (( port > 0 && port <= 65535 )) || port=
       [[ -n $port ]] && break
       (( stop )) && break
       kill -0 $caddy_pid 2>/dev/null || break
@@ -55,8 +62,11 @@ serve() {
       # Interrupted during startup: the terminal's SIGINT also reached caddy
       # directly, so its state says nothing, and nothing else gets started
       :
-    elif [[ -z $port ]]; then
+    elif ! kill -0 $caddy_pid 2>/dev/null; then
       print -u2 "serve: caddy failed to start"
+      rc=1
+    elif [[ -z $port ]]; then
+      print -u2 "serve: could not read the port caddy is listening on"
       rc=1
     else
       # The tunnel is public and nothing is hidden (dotfiles included), so make
