@@ -10,10 +10,12 @@ process outside serve's own process group was ever signalled).
 cloudflared is replaced by a sleeping stub in every scenario by default,
 because Cloudflare rate-limits how often one IP can provision quick tunnels
 and a routine test run would otherwise start hitting 429s after a handful of
-runs. Pass --real-tunnel to use the real binary for the scenarios that care
-about tunnel content (single instance, concurrency); everything that tests
-signal handling or process lifecycle behaves identically either way, since
-that logic never looks at what cloudflared actually is.
+runs. Pass --real-tunnel to use the real binary wherever a scenario runs
+with a working cloudflared: that checks the tunnel itself (URL, --url target)
+and, in stop_during_download, a request the real cloudflared is still
+proxying when serve stops. The stub cannot stand in for that last part: the
+real binary reacts to a repeated signal differently from a plain process,
+which is exactly what serve's cleanup has to get right.
 
 Requires: macOS, python3, a real `caddy` binary on PATH. `cloudflared` is only
 required on PATH when --real-tunnel is passed.
@@ -140,6 +142,7 @@ class Shell:
 
 SHELL_PIDS = []       # pty shells this suite created, while they are alive
 KNOWN_OURS = set()    # every pid ever observed as a descendant of one of them
+KNOWN_GROUPS = set()  # process groups ever observed with one of ours as leader
 
 
 def _descendants(roots):
@@ -162,6 +165,16 @@ def refresh_ours():
     """
     SHELL_PIDS[:] = [p for p in SHELL_PIDS if alive(p)]
     KNOWN_OURS.update(_descendants(SHELL_PIDS))
+    # A process can also escape before the walk above ever sees it: serve
+    # dying right after launching cloudflared, say, which is exactly the leak
+    # these tests exist to catch. Reparented to launchd, it no longer leads
+    # back to us, but it keeps its process group. Claiming by group too keeps
+    # such a leak visible to no_orphans() and reapable, instead of passing
+    # every "no leftover processes" check unseen and sleeping on for hours.
+    pairs = [l.split() for l in subprocess.run(['ps', '-A', '-o', 'pid=,pgid='],
+                                              capture_output=True).stdout.decode().splitlines()]
+    KNOWN_GROUPS.update(g for p, g in pairs if p == g and p in KNOWN_OURS)
+    KNOWN_OURS.update(p for p, g in pairs if g in KNOWN_GROUPS)
 
 
 def our_pids(name=None, pattern=None):
@@ -376,9 +389,10 @@ def tunnel_url(sh):
     return m.group(0) if m else None
 
 
-def get(letter, port, host='localhost'):
+def get(letter, port, host='localhost', base=None):
     try:
-        return http_get(f'http://{host}:{port}/who.txt').strip() == f'content of site {letter}'
+        url = f'{base or f"http://{host}:{port}"}/who.txt'
+        return http_get(url).strip() == f'content of site {letter}'
     except Exception as e:
         return f'ERR {e}'
 
@@ -788,6 +802,146 @@ def ctrl_z_then_sigkill_other_instance_survives():
     _other_instance_survives('ctrl-z-then-kill')
 
 
+def serve_pid(parent_pid):
+    """The zsh running the serve script, as a direct child of `parent_pid`."""
+    kids = subprocess.run(['pgrep', '-P', str(parent_pid)], capture_output=True).stdout.decode().split()
+    for p in kids:
+        args = subprocess.run(['ps', '-o', 'args=', '-p', p], capture_output=True).stdout.decode()
+        if SERVE in args:
+            return int(p)
+    return None
+
+
+@scenario
+def signalled_directly():
+    """A signal sent to serve alone (say, `kill <pid>` from another terminal),
+    not to its whole group: caddy and cloudflared never see it themselves, so
+    only serve's own cleanup can stop them. Besides TERM and HUP, this covers
+    every rarer signal whose default action would end serve outright."""
+    results = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGALRM, signal.SIGUSR1, signal.SIGUSR2,
+                signal.SIGVTALRM, signal.SIGPROF, signal.SIGXCPU, signal.SIGXFSZ):
+        sh = Shell()
+        decoy = start_serve(sh, 'A')
+        sh.wait('Local: http://', 10)
+        wait_until(lambda: our_pids(name='caddy') and cf_pids())
+        pid = serve_pid(sh.pid)
+        if pid:
+            os.kill(pid, sig)
+        sh.wait(r'EXIT=\d+', 15)
+        ec = exit_code(sh)
+        sh.finish()
+        time.sleep(0.5)
+        r = {
+            'found serve': bool(pid),
+            'clean exit': ec == 0 or f'got {ec}',
+            'no leftover processes': not no_orphans(),
+            'decoy untouched': alive(decoy) is True,
+        }
+        reap(no_orphans() + our_pids(pattern=DECOY_PATTERN))
+        failed = {k: v for k, v in r.items() if v is not True}
+        if failed:
+            results[sig.name] = failed
+    record('any terminating signal sent to serve alone still stops everything', not results, results)
+
+
+@scenario
+def parent_dies_without_hangup():
+    """The parent shell is SIGKILLed but is not the session leader (a nested
+    shell inside the terminal's own), so the kernel sends no SIGHUP to anyone:
+    serve has to notice its reparenting by itself. The other parent-death
+    scenarios kill the session leader, where the kernel's SIGHUP alone would
+    already stop serve and hide a broken parent check."""
+    sh = Shell()
+    sh.cmd('zsh -f -i')
+    sh.wait(r'(?s)(\$ |% ).*(\$ |% )', 5)
+    nested = subprocess.run(['pgrep', '-P', str(sh.pid)], capture_output=True).stdout.decode().split()
+    decoy = start_serve(sh, 'A')
+    sh.wait('Local: http://', 10)
+    wait_until(lambda: our_pids(name='caddy') and cf_pids())
+    port = local_port(sh)
+    running = bool(our_pids(name='caddy')) and bool(cf_pids())
+    for p in nested:
+        os.kill(int(p), signal.SIGKILL)
+    t0 = time.time()
+    gone = wait_until(lambda: not no_orphans(), timeout=10)
+    dt = time.time() - t0
+    # serve itself exits a moment after its children, once its cleanup sees them gone
+    wait_until(lambda: not our_pids(pattern=SERVE), timeout=2)
+    serve_left = our_pids(pattern=SERVE)
+    closed = get('A', port) is not True
+    decoy_ok = alive(decoy) is True
+    sh.finish()
+    time.sleep(0.3)
+    ok = (len(nested) == 1 and running and gone and dt < 3 and not serve_left
+          and closed and decoy_ok)
+    record('parent shell dies without any SIGHUP: serve notices and cleans up', ok,
+           {'nested shells': nested, 'was running': running, 'cleaned up': gone,
+            'seconds': round(dt, 1), 'serve left': serve_left, 'port closed': closed,
+            'decoy untouched': decoy_ok})
+
+
+@scenario
+def stop_during_download():
+    """Stopping while someone is still downloading. Caddy's graceful shutdown
+    waits for transfers in progress with no time limit, so a single TERM left
+    serve waiting out its whole grace period and then reporting a SIGKILL
+    (137), as if a child had ignored the signal. It must stop promptly and
+    cleanly instead.
+
+    With --real-tunnel the download goes through the public tunnel, so the
+    real cloudflared is draining a request too: it reacts to repeated signals
+    differently from caddy, and a stub cannot stand in for that."""
+    big = os.path.join(WS.site('A'), 'big.bin')
+    if not os.path.exists(big):
+        with open(big, 'wb') as f:
+            f.write(os.urandom(64 * 1024 * 1024))
+    results = {}
+    for how in ('Ctrl-C', 'TERM to serve alone'):
+        sh = Shell()
+        decoy = start_serve(sh, 'A')
+        sh.wait('Local: http://', 10)
+        wait_until(lambda: our_pids(name='caddy') and cf_pids())
+        base = f'http://localhost:{local_port(sh)}'
+        reachable = True
+        if REAL_TUNNEL:
+            sh.wait(TUNNEL_URL_RE.pattern, 40)
+            base = tunnel_url(sh)
+            # a fresh quick tunnel can take a good while to resolve and route
+            reachable = wait_until(lambda: bool(base) and get('A', None, base=base) is True,
+                                   timeout=90, interval=1)
+        # throttled to well under the time this takes, so it is still in flight
+        curl = subprocess.Popen(['curl', '-s', '-o', '/dev/null', '--limit-rate', '200k',
+                                 f'{base}/big.bin'])
+        time.sleep(3.0 if REAL_TUNNEL else 1.0)
+        downloading = curl.poll() is None
+        t0 = time.time()
+        if how == 'Ctrl-C':
+            sh.send('\x03', settle=0)
+        else:
+            os.kill(serve_pid(sh.pid), signal.SIGTERM)
+        sh.wait(r'EXIT=\d+', 15)
+        dt = time.time() - t0
+        ec = exit_code(sh)
+        curl.kill()
+        curl.wait()
+        sh.finish()
+        time.sleep(0.5)
+        r = {
+            'tunnel reachable': reachable,
+            'download was in flight': downloading,
+            'clean exit': ec == 0 or f'got {ec}',
+            'stopped promptly': dt < 3 or f'{dt:.1f}s',
+            'no leftover processes': not no_orphans(),
+            'decoy untouched': alive(decoy) is True,
+        }
+        reap(no_orphans() + our_pids(pattern=DECOY_PATTERN))
+        failed = {k: v for k, v in r.items() if v is not True}
+        if failed:
+            results[how] = failed
+    record('stopping mid-download is prompt and clean, not a forced kill', not results, results)
+
+
 @scenario
 def missing_helper_commands():
     """Layer 1: every command serve shells out to is checked up front, and the
@@ -924,6 +1078,9 @@ SCENARIOS = [
     hangup_other_instance_survives,
     sigkill_other_instance_survives,
     ctrl_z_then_sigkill_other_instance_survives,
+    signalled_directly,
+    parent_dies_without_hangup,
+    stop_during_download,
     missing_helper_commands,
     helper_misbehaves_at_run_time,
     output_reader_exits,

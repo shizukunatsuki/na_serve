@@ -32,7 +32,7 @@ for arg; do
       exit 0
       ;;
     *)
-      print -u2 "serve: unknown option: $arg"
+      print -ru2 -- "serve: unknown option: $arg"
       print -u2 "usage: serve [--share]"
       exit 2
       ;;
@@ -78,7 +78,12 @@ fi
 # our output is piped into something that has already exited (say,
 # `serve --share 2>&1 | grep -m1 trycloudflare`), the next message we print
 # would otherwise kill us on the spot and leave caddy serving, orphaned.
-trap 'stop=1' INT HUP TERM QUIT PIPE
+# The rest are every other signal whose default action would end us just as
+# abruptly: rarely sent, but a stray `kill -USR1` must not orphan anything
+# either. Faults (SEGV and the like) are left alone, since trapping a real
+# one would only loop; like SIGKILL, they are beyond what a script can catch.
+typeset -a stop_signals=(INT HUP TERM QUIT PIPE ALRM USR1 USR2 VTALRM PROF XCPU XFSZ)
+trap 'stop=1' $stop_signals
 
 {
   # Port 0 makes the kernel hand out a free ephemeral port. A fixed port would
@@ -94,7 +99,11 @@ trap 'stop=1' INT HUP TERM QUIT PIPE
   # of a freshly installed binary can sit in macOS's malware scan for a few
   # seconds before it runs at all. A Ctrl-C during the poll also hits lsof
   # (same process group); the loop then ends through the trap on the next turn.
-  for i in {1..100}; do
+  # The window is measured on the clock, not in turns: each turn also forks
+  # lsof, which under load stretched a hundred 0.1s turns to over 13 seconds.
+  typeset -F SECONDS
+  typeset -F deadline=$(( SECONDS + 10 ))
+  while (( SECONDS < deadline )); do
     for line in ${(f)"$(lsof -nP -a -p $caddy_pid -iTCP -sTCP:LISTEN -Fn 2>/dev/null)"}; do
       [[ $line == n*:<-> ]] || continue
       port=${line##*:}
@@ -157,12 +166,20 @@ trap 'stop=1' INT HUP TERM QUIT PIPE
   # its own: a failed write to a closed stdout or stderr is such an error, and
   # would otherwise end the script right there, skipping this cleanup.
   (( TRY_BLOCK_ERROR )) && rc=1
-  trap '' INT HUP TERM QUIT PIPE
+  trap '' $stop_signals
   kill -TERM -$$
   kill -CONT -$$
   for i in {1..50}; do
     kill -0 $caddy_pid 2>/dev/null ||
       { [[ -n $cf_pid ]] && kill -0 $cf_pid 2>/dev/null } || exit $rc
+    # Still running after half a second almost always means draining a
+    # transfer in progress, which caddy would wait on forever. Both stop at
+    # once on a repeated signal, but not the same one: caddy only on a second
+    # SIGINT, cloudflared on a second anything, except that after its first
+    # it stops handling signals and SIGINT is back to ignored (as every
+    # background job starts), so only another TERM reaches it. Send both,
+    # twice; after a Ctrl-C each has already had its first.
+    (( i == 5 || i == 10 )) && { kill -INT -$$; kill -TERM -$$ }
     zselect -t 10
   done
   kill -KILL -$$
