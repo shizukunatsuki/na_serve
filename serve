@@ -47,7 +47,7 @@ done
 typeset cmd
 typeset -a needed=(caddy)
 (( share )) && needed+=(cloudflared)
-needed+=(scutil ps lsof)
+needed+=(scutil lsof)
 for cmd in $needed; do
   if (( ! $+commands[$cmd] )); then
     print -u2 "serve: $cmd not found"
@@ -60,98 +60,110 @@ typeset host=$(scutil --get LocalHostName 2>/dev/null)
 # $PPID is fixed at startup; sysparams[ppid] asks the kernel every time, which
 # is what noticing the parent shell's death needs
 typeset parent=$sysparams[ppid]
-typeset pgid=${$(ps -o pgid= -p $$)// /}
 typeset caddy_pid cf_pid stop=0 rc=0 i
 
-# All signals below target our own process group; refuse to run without one
-if [[ $pgid != $$ ]]; then
+# All signals below target our own process group; refuse to run without one.
+# A group whose ID is our PID exists exactly when we lead it, so the kernel
+# answers this directly: no ps output to parse or trust. If this passed while
+# we were not a leader, every kill -$$ below would hit nothing, and caddy and
+# cloudflared would outlive us.
+if ! kill -0 -$$ 2>/dev/null; then
   print -u2 "serve: not a process group leader, refusing to start"
   exit 1
 fi
 
 # Every way the terminal or the parent shell can tell us to stop, Ctrl-\
 # included: an untrapped SIGQUIT would end this script without the cleanup
-# below, leaving whatever ignores SIGQUIT running.
-trap 'stop=1' INT HUP TERM QUIT
+# below, leaving whatever ignores SIGQUIT running. SIGPIPE likewise: when
+# our output is piped into something that has already exited (say,
+# `serve --share 2>&1 | grep -m1 trycloudflare`), the next message we print
+# would otherwise kill us on the spot and leave caddy serving, orphaned.
+trap 'stop=1' INT HUP TERM QUIT PIPE
 
-# Port 0 makes the kernel hand out a free ephemeral port. A fixed port would
-# not be safe: Caddy sets SO_REUSEPORT, so a second instance would silently
-# share a busy port instead of failing, and all traffic would keep going to
-# the first one.
-caddy file-server --browse --listen :0 </dev/null &
-caddy_pid=$!
+{
+  # Port 0 makes the kernel hand out a free ephemeral port. A fixed port would
+  # not be safe: Caddy sets SO_REUSEPORT, so a second instance would silently
+  # share a busy port instead of failing, and all traffic would keep going to
+  # the first one.
+  caddy file-server --browse --listen :0 </dev/null &
+  caddy_pid=$!
 
-# Wait until caddy is listening and read back the port it was given. Caddy
-# opens a single dual-stack listener for :0, so the first address lsof
-# reports is the only one. The window is generous because the first launch
-# of a freshly installed binary can sit in macOS's malware scan for a few
-# seconds before it runs at all. A Ctrl-C during the poll also hits lsof
-# (same process group); the loop then ends through the trap on the next turn.
-for i in {1..100}; do
-  for line in ${(f)"$(lsof -nP -a -p $caddy_pid -iTCP -sTCP:LISTEN -Fn 2>/dev/null)"}; do
-    [[ $line == n*:<-> ]] || continue
-    port=${line##*:}
-    # Anything but a real TCP port number means lsof misbehaved; it must
-    # not reach cloudflared as part of a URL. The length check keeps
-    # absurd input away from the arithmetic, which would warn about it.
-    (( ${#port} <= 5 && port > 0 && port <= 65535 )) || port=
-    break
+  # Wait until caddy is listening and read back the port it was given. Caddy
+  # opens a single dual-stack listener for :0, so the first address lsof
+  # reports is the only one. The window is generous because the first launch
+  # of a freshly installed binary can sit in macOS's malware scan for a few
+  # seconds before it runs at all. A Ctrl-C during the poll also hits lsof
+  # (same process group); the loop then ends through the trap on the next turn.
+  for i in {1..100}; do
+    for line in ${(f)"$(lsof -nP -a -p $caddy_pid -iTCP -sTCP:LISTEN -Fn 2>/dev/null)"}; do
+      [[ $line == n*:<-> ]] || continue
+      port=${line##*:}
+      # Anything but a real TCP port number means lsof misbehaved; it must
+      # not reach cloudflared as part of a URL. The length check keeps
+      # absurd input away from the arithmetic, which would warn about it.
+      (( ${#port} <= 5 && port > 0 && port <= 65535 )) || port=
+      break
+    done
+    [[ -n $port ]] && break
+    (( stop )) && break
+    kill -0 $caddy_pid 2>/dev/null || break
+    zselect -t 10
   done
-  [[ -n $port ]] && break
-  (( stop )) && break
-  kill -0 $caddy_pid 2>/dev/null || break
-  zselect -t 10
-done
 
-if (( stop )); then
-  # Interrupted during startup: the same signal also reached caddy directly,
-  # so its state says nothing, and nothing else gets started
-  :
-elif ! kill -0 $caddy_pid 2>/dev/null; then
-  print -u2 "serve: caddy failed to start"
-  rc=1
-elif [[ -z $port ]]; then
-  print -u2 "serve: could not read the port caddy is listening on"
-  rc=1
-else
-  # Anyone on the LAN (and with --share, anyone at all) can read this, with
-  # nothing hidden (dotfiles included), so make the exposed directory hard to
-  # miss: bold red, spelled out as escape codes because a non-interactive zsh
-  # has no terminal capabilities for %B.
-  print -r -- $'\e[1;31m'"Serving: ${PWD}"$'\e[0m'
-  if [[ -n $host ]]; then
-    print "Local: http://${host}.local:${port}/"
+  if (( stop )); then
+    # Interrupted during startup: the same signal also reached caddy directly,
+    # so its state says nothing, and nothing else gets started
+    :
+  elif ! kill -0 $caddy_pid 2>/dev/null; then
+    print -u2 "serve: caddy failed to start"
+    rc=1
+  elif [[ -z $port ]]; then
+    print -u2 "serve: could not read the port caddy is listening on"
+    rc=1
   else
-    print "Local: http://localhost:${port}/ (LocalHostName is not set, so there is no .local name)"
-  fi
-  if (( share )); then
-    cloudflared tunnel --url "http://localhost:${port}" </dev/null &
-    cf_pid=$!
-  fi
+    # Anyone on the LAN (and with --share, anyone at all) can read this, with
+    # nothing hidden (dotfiles included), so make the exposed directory hard to
+    # miss: bold red, spelled out as escape codes because a non-interactive zsh
+    # has no terminal capabilities for %B.
+    print -r -- $'\e[1;31m'"Serving: ${PWD}"$'\e[0m'
+    if [[ -n $host ]]; then
+      print "Local: http://${host}.local:${port}/"
+    else
+      print "Local: http://localhost:${port}/ (LocalHostName is not set, so there is no .local name)"
+    fi
+    if (( share )); then
+      cloudflared tunnel --url "http://localhost:${port}" </dev/null &
+      cf_pid=$!
+    fi
 
-  # Run until interrupted, a service exits, or the parent shell dies. A
-  # service found gone right after an interrupt is not an error: the same
-  # signal reached it directly, and the cleanup below is about to run anyway.
-  while (( ! stop && sysparams[ppid] == parent )); do
-    if ! kill -0 $caddy_pid 2>/dev/null; then
-      (( stop )) || { print -u2 "serve: caddy exited"; rc=1 }
-      break
-    fi
-    if [[ -n $cf_pid ]] && ! kill -0 $cf_pid 2>/dev/null; then
-      (( stop )) || { print -u2 "serve: cloudflared exited"; rc=1 }
-      break
-    fi
-    zselect -t 50
+    # Run until interrupted, a service exits, or the parent shell dies. A
+    # service found gone right after an interrupt is not an error: the same
+    # signal reached it directly, and the cleanup below is about to run anyway.
+    while (( ! stop && sysparams[ppid] == parent )); do
+      if ! kill -0 $caddy_pid 2>/dev/null; then
+        (( stop )) || { print -u2 "serve: caddy exited"; rc=1 }
+        break
+      fi
+      if [[ -n $cf_pid ]] && ! kill -0 $cf_pid 2>/dev/null; then
+        (( stop )) || { print -u2 "serve: cloudflared exited"; rc=1 }
+        break
+      fi
+      zselect -t 50
+    done
+  fi
+} always {
+  # Stop everything in our process group (never signal bare PIDs). This runs
+  # however the block above ends, including when zsh aborts it on an error of
+  # its own: a failed write to a closed stdout or stderr is such an error, and
+  # would otherwise end the script right there, skipping this cleanup.
+  (( TRY_BLOCK_ERROR )) && rc=1
+  trap '' INT HUP TERM QUIT PIPE
+  kill -TERM -$$
+  kill -CONT -$$
+  for i in {1..50}; do
+    kill -0 $caddy_pid 2>/dev/null ||
+      { [[ -n $cf_pid ]] && kill -0 $cf_pid 2>/dev/null } || exit $rc
+    zselect -t 10
   done
-fi
-
-# Stop everything in our process group (never signal bare PIDs)
-trap '' INT HUP TERM QUIT
-kill -TERM -$$
-kill -CONT -$$
-for i in {1..50}; do
-  kill -0 $caddy_pid 2>/dev/null ||
-    { [[ -n $cf_pid ]] && kill -0 $cf_pid 2>/dev/null } || exit $rc
-  zselect -t 10
-done
-kill -KILL -$$
+  kill -KILL -$$
+}

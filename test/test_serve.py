@@ -243,7 +243,7 @@ def reap(pids):
 
 # Every command serve --share shells out to; its pre-flight check must cover
 # all of them (without --share, cloudflared is not needed)
-REQUIRED_COMMANDS = ('caddy', 'cloudflared', 'scutil', 'ps', 'lsof')
+REQUIRED_COMMANDS = ('caddy', 'cloudflared', 'scutil', 'lsof')
 
 
 class Workspace:
@@ -259,6 +259,9 @@ class Workspace:
     # off everything short of SIGKILL
     STUB_IGNORES_SIGNALS = '#!/bin/sh\ntrap "" TERM HUP INT QUIT\nexec /bin/sleep 7200\n'
     STUB_EXIT_1 = '#!/bin/sh\nexit 1\n'
+    # Keeps logging after its first line, like the real cloudflared does
+    STUB_CF_CHATTY = ('#!/bin/sh\necho "CF_INVOKED_WITH: $*" >&2\n'
+                      '/bin/sleep 1\necho "still logging" >&2\nexec /bin/sleep 7200\n')
 
     def __init__(self):
         self.root = tempfile.mkdtemp(prefix='na_serve_test_')
@@ -333,7 +336,7 @@ def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, pat
                 HIDES a binary installed elsewhere (e.g. cloudflared under
                 /opt/homebrew/bin) while ordinary tools stay reachable
       'only'    the stub directory and nothing else, the only way to hide a
-                tool that lives in a system directory (lsof, ps, scutil...)
+                tool that lives in a system directory (lsof, scutil...)
     """
     if path_prefix == 'real-or-stub':
         path_prefix = None if REAL_TUNNEL else cf_path('sleep')
@@ -858,6 +861,35 @@ def helper_misbehaves_at_run_time():
 
 
 @scenario
+def output_reader_exits():
+    """serve's output piped into something that exits early. Whatever serve
+    prints next hits a closed pipe: that must neither kill serve outright
+    (SIGPIPE) nor make zsh abort the script on the write error, since either
+    one skips the cleanup and leaves caddy serving with no parent."""
+    results = {}
+    chatty = WS.stub_dir('cf-chatty', {'caddy': None, 'cloudflared': WS.STUB_CF_CHATTY})
+    for label, prefix, args in (
+            ('--share 2>&1 | grep -m1 (the reader leaves mid-run)', chatty,
+             '--share 2>&1 | grep -m1 CF_INVOKED_WITH'),
+            ('| true (the reader is gone before serve prints)', cf_path('sleep'), '| true')):
+        sh = Shell()
+        decoy = start_serve(sh, 'A', path_prefix=prefix, args=args)
+        returned = sh.wait(r'EXIT=\d+', 15)
+        time.sleep(0.5)
+        r = {
+            'serve ended by itself': returned,
+            'no leftover processes': not no_orphans(),
+            'decoy untouched': alive(decoy) is True,
+        }
+        sh.finish()
+        reap(our_pids(pattern=DECOY_PATTERN))
+        failed = {k: v for k, v in r.items() if v is not True}
+        if failed:
+            results[label] = failed
+    record('output piped into a reader that exits never orphans caddy', not results, results)
+
+
+@scenario
 def refuses_without_a_tty():
     # Not a pty shell, so it is registered by hand for the ownership sampler:
     # otherwise a caddy started here would never be recognised as ours
@@ -894,6 +926,7 @@ SCENARIOS = [
     ctrl_z_then_sigkill_other_instance_survives,
     missing_helper_commands,
     helper_misbehaves_at_run_time,
+    output_reader_exits,
     refuses_without_a_tty,
 ]
 
