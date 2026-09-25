@@ -241,7 +241,8 @@ def reap(pids):
             pass
 
 
-# Every command serve shells out to; its pre-flight check must cover all of them
+# Every command serve --share shells out to; its pre-flight check must cover
+# all of them (without --share, cloudflared is not needed)
 REQUIRED_COMMANDS = ('caddy', 'cloudflared', 'scutil', 'ps', 'lsof')
 
 
@@ -317,10 +318,14 @@ def cf_path(behavior='sleep'):
     return WS.stub_dir(f'cf-{behavior}', {'caddy': None, 'cloudflared': body})
 
 
-def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, path_mode='prefix'):
+def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, path_mode='prefix',
+                args='--share'):
     """cd into a per-scenario site dir, start a decoy background job (a sleep
-    whose 71xx duration tags it as a decoy), then invoke serve. Returns the
-    decoy's PID.
+    whose 71xx duration tags it as a decoy), then invoke serve with `args`.
+    Returns the decoy's PID.
+
+    `args` defaults to --share: most scenarios are about running caddy and
+    cloudflared side by side. Pass '' for serve's default, LAN-only mode.
 
     `path_mode` decides how the stub directory relates to the real PATH:
       'prefix'  prepend it, so a stub shadows the real binary of that name
@@ -343,7 +348,7 @@ def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, pat
     sh.cmd(f'sleep {decoy_tag} &')
     m = re.search(r'\[\d+\] (\d+)', sh.text()[-200:])
     decoy = m.group(1) if m else None
-    sh.cmd(f'"{SERVE}"; print EXIT=$?', settle=0.05)
+    sh.cmd(' '.join(filter(None, [f'"{SERVE}"', args])) + '; print EXIT=$?', settle=0.05)
     return decoy
 
 
@@ -573,9 +578,9 @@ def ctrl_c_during_startup():
            ok, {'exit': ec, 'output_tail': t[-200:]})
 
 
-def _service_crashes(which):
+def _service_crashes(which, args='--share'):
     sh = Shell()
-    decoy = start_serve(sh, 'A')
+    decoy = start_serve(sh, 'A', args=args)
     sh.wait('Local: http://', 10)
     time.sleep(1.5)
     # only ever the process this scenario started: `which` names a program that
@@ -589,7 +594,10 @@ def _service_crashes(which):
     sh.finish()
     time.sleep(0.5)
     ok = ec == 1 and msg and not no_orphans() and alive(decoy) is True
-    record(f'{which} crashing brings the other one down too', ok, {'exit': ec, 'saw_message': msg})
+    if args:
+        record(f'{which} crashing brings the other one down too', ok, {'exit': ec, 'saw_message': msg})
+    else:
+        record(f'{which} crashing without --share is reported', ok, {'exit': ec, 'saw_message': msg})
 
 
 @scenario
@@ -600,6 +608,11 @@ def caddy_crashes():
 @scenario
 def cloudflared_crashes():
     _service_crashes('cloudflared')
+
+
+@scenario
+def caddy_crashes_without_share():
+    _service_crashes('caddy', args='')
 
 
 @scenario
@@ -643,7 +656,67 @@ def cloudflared_missing():
     sh.finish()
     time.sleep(0.5)
     ok = ec == 1 and msg and not no_orphans() and alive(decoy) is True
-    record('missing cloudflared refuses to start anything', ok, {'exit': ec})
+    record('with --share, missing cloudflared refuses to start anything', ok, {'exit': ec})
+
+
+@scenario
+def local_only_by_default():
+    """Without --share nothing is published beyond the LAN: cloudflared is
+    never started, and does not even have to be installed."""
+    results = {}
+    for label, prefix, mode in (('stub cloudflared on PATH', cf_path('sleep'), 'prefix'),
+                                ('no cloudflared at all', cf_path('missing'), 'system')):
+        sh = Shell()
+        decoy = start_serve(sh, 'A', path_prefix=prefix, path_mode=mode, args='')
+        sh.wait('Local: http://', 10)
+        time.sleep(1.5)   # room for a wrongly started cloudflared to show up
+        port = local_port(sh)
+        r = {
+            'serves the directory': bool(port) and get('A', port) is True,
+            'cloudflared never started': 'CF_INVOKED_WITH' not in sh.text() and not cf_pids(),
+            'no complaint about cloudflared': 'cloudflared' not in serve_output(sh),
+        }
+        sh.send('\x03')
+        sh.wait(r'EXIT=\d+', 15)
+        r['clean exit on Ctrl-C'] = exit_code(sh) == 0
+        sh.finish()
+        time.sleep(0.5)
+        r['no leftover processes'] = not no_orphans()
+        r['decoy untouched'] = alive(decoy) is True
+        reap(our_pids(pattern=DECOY_PATTERN))
+        failed = {k: v for k, v in r.items() if v is not True}
+        if failed:
+            results[label] = failed
+    record('without --share only caddy runs, and cloudflared is optional', not results, results)
+
+
+@scenario
+def command_line_arguments():
+    """An unknown option (a typo of --share, say) is refused before anything
+    starts, rather than silently serving without the tunnel that was asked
+    for; --help prints usage and starts nothing either."""
+    results = {}
+    for args, want_exit, want_text in (('--shar', 2, 'serve: unknown option: --shar'),
+                                       ('share', 2, 'serve: unknown option: share'),
+                                       ('--help', 0, 'usage: serve [--share]')):
+        sh = Shell()
+        decoy = start_serve(sh, 'A', args=args)
+        sh.wait(r'EXIT=\d+', 10)
+        t, ec = serve_output(sh), exit_code(sh)
+        sh.finish()
+        time.sleep(0.4)
+        r = {
+            'exit': ec == want_exit or f'got {ec}, want {want_exit}',
+            'message': want_text in t,
+            'nothing served': 'Serving:' not in t,
+            'nothing left running': not no_orphans(),
+            'decoy untouched': alive(decoy) is True,
+        }
+        reap(our_pids(pattern=DECOY_PATTERN))
+        failed = {k: v for k, v in r.items() if v is not True}
+        if failed:
+            results[args] = failed
+    record('bad arguments are refused and --help starts nothing', not results, results)
 
 
 @scenario
@@ -809,9 +882,12 @@ SCENARIOS = [
     ctrl_c_during_startup,
     caddy_crashes,
     cloudflared_crashes,
+    caddy_crashes_without_share,
     caddy_exits_immediately,
     caddy_never_listens,
     cloudflared_missing,
+    local_only_by_default,
+    command_line_arguments,
     cloudflared_ignores_signals,
     hangup_other_instance_survives,
     sigkill_other_instance_survives,

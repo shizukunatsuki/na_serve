@@ -5,6 +5,9 @@
 以及场景开始时启动的一个无关"诱饵"进程仍然存活——后者用来确认清理逻辑真的
 只对 `serve` 自己的进程组发信号，没有误伤旁路进程。全套串行跑一遍约 4–5 分钟。
 
+大多数场景以 `serve --share` 运行（要测的正是 caddy 和 cloudflared 并存时的生命周期）；
+另有专门的场景覆盖默认的仅局域网模式和命令行参数。
+
 ```bash
 python3 test_serve.py              # 默认用不联网的 cloudflared 桩替身
 python3 test_serve.py --real-tunnel # 换成真实 cloudflared，校验隧道 URL 和 --url 参数

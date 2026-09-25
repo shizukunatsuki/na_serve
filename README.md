@@ -1,13 +1,14 @@
 # na_serve
 
-一个 zsh 脚本：用 [Caddy](https://caddyserver.com/) 把当前目录发布到局域网，同时用
-[cloudflared](https://github.com/cloudflare/cloudflared) 开一条临时公网隧道，替代
-`python3 -m http.server`。仅支持 macOS。
+一个 zsh 脚本：用 [Caddy](https://caddyserver.com/) 把当前目录发布到局域网，加
+`--share` 时再用 [cloudflared](https://github.com/cloudflare/cloudflared) 开一条临时
+公网隧道，替代 `python3 -m http.server`。仅支持 macOS。
 
 ## 依赖
 
 ```bash
-brew install caddy cloudflared
+brew install caddy
+brew install cloudflared   # 只有 --share 才需要
 ```
 
 ## 安装
@@ -23,14 +24,21 @@ alias serve=/path/to/na_serve/serve
 
 ```bash
 cd 想分享的目录
-serve
+serve            # 只发布到局域网
+serve --share    # 同时开一条 cloudflared 临时公网隧道
 ```
 
 ```
+$ serve --share
 Serving: /Users/you/some/dir          ← 红色粗体，提醒当前暴露的是哪个目录
 Local: http://your-mac.local:61234/
 2026-... INF |  https://random-words-here.trycloudflare.com  |
 ```
+
+不带 `--share` 时只有前两行，不会启动 cloudflared，也不要求装了它。
+公网隧道必须显式要求才会打开：把目录暴露到整个互联网不应该是默认行为。
+参数写错（比如 `--shar`）会直接报错退出（退出码 2），而不是悄悄以不带隧道的方式
+跑起来；`serve --help` 打印用法。
 
 `Ctrl-C`（或 `Ctrl-\`）停止服务。可以在不同目录里同时开多个 `serve`，每个实例各用各的随机端口，互不干扰。
 
@@ -42,8 +50,8 @@ Local: http://your-mac.local:61234/
   这是比"启动失败"更危险的错误。读端口最多等 10 秒：新装的二进制第一次启动时可能
   先被 macOS 的恶意软件扫描拖住几秒。
 - **隧道目标是 `localhost`，不是 `127.0.0.1`**，同时监听 IPv4/IPv6。
-- **启动前检查**：`serve` 会用到的每一个外部命令（`caddy`、`cloudflared`、`scutil`、
-  `ps`、`lsof`）都在启动任何东西之前检查一遍，缺哪个就报哪个的名字并退出。
+- **启动前检查**：`serve` 会用到的每一个外部命令（`caddy`、`scutil`、`ps`、`lsof`，
+  以及 `--share` 时的 `cloudflared`）都在启动任何东西之前检查一遍，缺哪个就报哪个的名字并退出。
   这样环境缺失不会伪装成别的症状——比如少了 `lsof`，端口就永远读不出来，看起来和
   "caddy 起不来"一模一样。
 - **读到的端口会被校验**：`lsof` 的输出由 zsh 自己解析，只有 1–65535 的整数会被接受。
@@ -55,13 +63,14 @@ Local: http://your-mac.local:61234/
   不是组长时（例如没有终端）拒绝启动。`kill -0` 只用来探测进程是否存活，从不用来发送信号。
   这样即使某个 PID 在极端情况下被系统回收复用，也不会误杀到无关进程。
 - Ctrl-C、Ctrl-\、关闭终端（HUP）、父 shell 被杀、`Ctrl-Z` 后父 shell 被杀，都会在几秒内
-  干净地停掉 Caddy 和 cloudflared；任何一个服务自己崩溃也会带着另一个一起收尾。
+  干净地停掉 Caddy 和 cloudflared（如果开了）；任何一个服务自己崩溃也会带着另一个一起收尾。
   对忽略普通终止信号的子进程，5 秒宽限后升级为 `SIGKILL`。
 
 ## 安全提示
 
-公网隧道没有任何鉴权，`--browse` 的目录列表也不隐藏点文件。不要在包含
-`.env`、`.git`、密钥等内容的目录里运行；分享前自己检查一遍目录内容。
+没有任何鉴权，`--browse` 的目录列表也不隐藏点文件。不带 `--share` 时同一局域网里的
+人都能访问；带 `--share` 时则是互联网上的任何人。不要在包含 `.env`、`.git`、密钥等
+内容的目录里运行；分享前自己检查一遍目录内容。
 
 ## 已知限制
 
@@ -74,7 +83,8 @@ Local: http://your-mac.local:61234/
 
 `test/test_serve.py` 用真实的 caddy / cloudflared 二进制、在伪终端里驱动交互式 zsh，
 覆盖单实例、多实例并发、各种中断路径（`Ctrl-C`、`Ctrl-\`、关终端、父 shell 被杀、服务自身崩溃）、
-以及环境缺失（每个外部命令逐一缺席、命令存在却返回垃圾）。每个场景结束后都断言：
+环境缺失（每个外部命令逐一缺席、命令存在却返回垃圾）、以及命令行参数（不带 `--share`
+时不启动 cloudflared、写错的参数被拒绝）。每个场景结束后都断言：
 没有残留进程、没有殃及无关的旁路进程。测试只会观察和终止它自己启动的进程，机器上
 别的 caddy（包括你自己正在跑的 `serve`）既不会被误判成泄漏，也不会被碰。
 默认用一个不产生真实网络连接的 cloudflared 桩替身运行（Cloudflare 的 quick tunnel

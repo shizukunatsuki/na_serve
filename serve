@@ -1,10 +1,13 @@
 #!/bin/zsh -f
-# serve: temporary HTTP file server + public tunnel
+# serve: temporary HTTP file server, optionally with a public tunnel
 #
-# Serve the current directory with Caddy on a kernel-assigned port (LAN) and a
-# cloudflared quick tunnel (public). Ctrl-C stops both. Signals are only ever
-# sent to our own process group, so nothing outside `serve` can be killed by
-# mistake. Several instances can run at once, each on its own port.
+# Usage: serve [--share]
+#
+# Serve the current directory with Caddy on a kernel-assigned port (LAN).
+# With --share, also open a cloudflared quick tunnel (public); without it,
+# nothing leaves the local network. Ctrl-C stops everything. Signals are only
+# ever sent to our own process group, so nothing outside `serve` can be killed
+# by mistake. Several instances can run at once, each on its own port.
 #
 # The invoking shell runs this script as a foreground job in a process group
 # of its own; job control stays off in here, so caddy and cloudflared land in
@@ -16,12 +19,36 @@ setopt nobgnice
 
 zmodload zsh/system zsh/zselect || exit 1
 
+# The public tunnel is opt-in: exposing a directory to the whole internet
+# should never be what happens by default.
+typeset arg share=0
+for arg; do
+  case $arg in
+    --share) share=1 ;;
+    -h|--help)
+      print "usage: serve [--share]"
+      print "  Serve the current directory on the local network."
+      print "  --share  also open a public cloudflared quick tunnel"
+      exit 0
+      ;;
+    *)
+      print -u2 "serve: unknown option: $arg"
+      print -u2 "usage: serve [--share]"
+      exit 2
+      ;;
+  esac
+done
+
 # Everything serve shells out to. A missing helper is checked here so it
 # fails with its own name, instead of surfacing later as a symptom that
 # points at the wrong thing: without lsof the port simply never turns up,
 # which is indistinguishable from caddy never managing to listen.
+# cloudflared only matters when there is a tunnel to open.
 typeset cmd
-for cmd in caddy cloudflared scutil ps lsof; do
+typeset -a needed=(caddy)
+(( share )) && needed+=(cloudflared)
+needed+=(scutil ps lsof)
+for cmd in $needed; do
   if (( ! $+commands[$cmd] )); then
     print -u2 "serve: $cmd not found"
     exit 1
@@ -87,17 +114,20 @@ elif [[ -z $port ]]; then
   print -u2 "serve: could not read the port caddy is listening on"
   rc=1
 else
-  # The tunnel is public and nothing is hidden (dotfiles included), so make
-  # the exposed directory hard to miss: bold red, spelled out as escape codes
-  # because a non-interactive zsh has no terminal capabilities for %B.
+  # Anyone on the LAN (and with --share, anyone at all) can read this, with
+  # nothing hidden (dotfiles included), so make the exposed directory hard to
+  # miss: bold red, spelled out as escape codes because a non-interactive zsh
+  # has no terminal capabilities for %B.
   print -r -- $'\e[1;31m'"Serving: ${PWD}"$'\e[0m'
   if [[ -n $host ]]; then
     print "Local: http://${host}.local:${port}/"
   else
     print "Local: http://localhost:${port}/ (LocalHostName is not set, so there is no .local name)"
   fi
-  cloudflared tunnel --url "http://localhost:${port}" </dev/null &
-  cf_pid=$!
+  if (( share )); then
+    cloudflared tunnel --url "http://localhost:${port}" </dev/null &
+    cf_pid=$!
+  fi
 
   # Run until interrupted, a service exits, or the parent shell dies. A
   # service found gone right after an interrupt is not an error: the same
@@ -107,7 +137,7 @@ else
       (( stop )) || { print -u2 "serve: caddy exited"; rc=1 }
       break
     fi
-    if ! kill -0 $cf_pid 2>/dev/null; then
+    if [[ -n $cf_pid ]] && ! kill -0 $cf_pid 2>/dev/null; then
       (( stop )) || { print -u2 "serve: cloudflared exited"; rc=1 }
       break
     fi
@@ -120,7 +150,8 @@ trap '' INT HUP TERM QUIT
 kill -TERM -$$
 kill -CONT -$$
 for i in {1..50}; do
-  kill -0 $caddy_pid 2>/dev/null || kill -0 $cf_pid 2>/dev/null || exit $rc
+  kill -0 $caddy_pid 2>/dev/null ||
+    { [[ -n $cf_pid ]] && kill -0 $cf_pid 2>/dev/null } || exit $rc
   zselect -t 10
 done
 kill -KILL -$$
