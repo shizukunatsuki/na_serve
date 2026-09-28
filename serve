@@ -6,8 +6,10 @@
 # Serve the current directory with Caddy on a kernel-assigned port (LAN).
 # With --share, also open a cloudflared quick tunnel (public); without it,
 # nothing leaves the local network. Ctrl-C stops everything. Signals are only
-# ever sent to our own process group, so nothing outside `serve` can be killed
-# by mistake. Several instances can run at once, each on its own port.
+# ever sent to our own process group: serve, its services, and whatever else
+# the invoking shell put in the same job (the rest of a pipeline serve runs
+# in, which stops along with it). Nothing outside that can be killed by
+# mistake. Several instances can run at once, each on its own port.
 #
 # The invoking shell runs this script as a foreground job in a process group
 # of its own; job control stays off in here, so caddy and cloudflared land in
@@ -76,13 +78,17 @@ fi
 # included: an untrapped SIGQUIT would end this script without the cleanup
 # below, leaving whatever ignores SIGQUIT running. SIGPIPE likewise: when
 # our output is piped into something that has already exited (say,
-# `serve --share 2>&1 | grep -m1 trycloudflare`), the next message we print
-# would otherwise kill us on the spot and leave caddy serving, orphaned.
-# The rest are every other signal whose default action would end us just as
-# abruptly: rarely sent, but a stray `kill -USR1` must not orphan anything
-# either. Faults (SEGV and the like) are left alone, since trapping a real
+# `serve 2>&1 | head -3`), the next message we print would otherwise kill us
+# on the spot and leave caddy serving, orphaned; trapped, serve stops as a
+# whole instead. The rest are every other signal whose default action would
+# end us just as abruptly: rarely sent, but a stray `kill -USR1` must not
+# orphan anything either. ABRT and SYS are safe to trap too: abort() still
+# ends the process once the trap returns, and a bad system call just fails
+# with ENOSYS. Faults that re-run the faulting instruction when the handler
+# returns (SEGV, BUS, ILL, FPE, TRAP) are left alone, since trapping a real
 # one would only loop; like SIGKILL, they are beyond what a script can catch.
-typeset -a stop_signals=(INT HUP TERM QUIT PIPE ALRM USR1 USR2 VTALRM PROF XCPU XFSZ)
+typeset -a stop_signals=(INT HUP TERM QUIT PIPE ALRM USR1 USR2 VTALRM PROF XCPU XFSZ
+  ABRT EMT SYS)
 trap 'stop=1' $stop_signals
 
 {
@@ -133,8 +139,13 @@ trap 'stop=1' $stop_signals
     # Anyone on the LAN (and with --share, anyone at all) can read this, with
     # nothing hidden (dotfiles included), so make the exposed directory hard to
     # miss: bold red, spelled out as escape codes because a non-interactive zsh
-    # has no terminal capabilities for %B.
-    print -r -- $'\e[1;31m'"Serving: ${PWD}"$'\e[0m'
+    # has no terminal capabilities for %B. Only on a terminal, though; in a
+    # file or a pipe the codes would just be noise.
+    if [[ -t 1 ]]; then
+      print -r -- $'\e[1;31m'"Serving: ${PWD}"$'\e[0m'
+    else
+      print -r -- "Serving: ${PWD}"
+    fi
     if [[ -n $host ]]; then
       print "Local: http://${host}.local:${port}/"
     else

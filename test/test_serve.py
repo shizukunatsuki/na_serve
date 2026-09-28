@@ -100,6 +100,15 @@ class Shell:
             time.sleep(0.02)
         return False
 
+    def wait_after(self, start, pattern, timeout):
+        """Like wait(), but only output from offset `start` on counts."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if re.search(pattern, self.text()[start:]):
+                return True
+            time.sleep(0.02)
+        return False
+
     def send(self, data, settle=0.3):
         try:
             os.write(self.fd, data.encode() if isinstance(data, str) else data)
@@ -361,8 +370,15 @@ def start_serve(sh, site_letter, path_prefix='real-or-stub', decoy_tag=7101, pat
         else:
             sh.cmd(f'export PATH="{path_prefix}:$PATH"')
     sh.cmd(f'cd "{WS.site(site_letter)}"')
-    sh.cmd(f'sleep {decoy_tag} &')
-    m = re.search(r'\[\d+\] (\d+)', sh.text()[-200:])
+    # Wait for the job line itself rather than a fixed pause: on a loaded
+    # machine it can arrive late, and a missed decoy PID fails the "decoy
+    # untouched" check with nothing actually wrong. Only output from this
+    # command counts, so a job line from earlier in the shell cannot match.
+    start = len(sh.text())
+    sh.cmd(f'sleep {decoy_tag} &', settle=0)
+    job = re.compile(r'\[\d+\] (\d+)')
+    sh.wait_after(start, job.pattern, 5)
+    m = job.search(sh.text()[start:])
     decoy = m.group(1) if m else None
     sh.cmd(' '.join(filter(None, [f'"{SERVE}"', args])) + '; print EXIT=$?', settle=0.05)
     return decoy
@@ -639,11 +655,19 @@ def caddy_exits_immediately():
     sh.wait(r'EXIT=\d+', 15)
     t = serve_output(sh)
     ec = exit_code(sh)
-    ok = ec == 1 and 'serve: caddy failed to start' in t and 'cloudflared' not in t
     sh.finish()
     time.sleep(0.5)
-    ok = ok and not no_orphans() and alive(decoy) is True
-    record('caddy exiting immediately is reported and nothing else starts', ok, {'exit': ec})
+    r = {
+        'exit': ec == 1 or f'got {ec}',
+        'reported': 'serve: caddy failed to start' in t,
+        'cloudflared never mentioned': 'cloudflared' not in t,
+        'no leftover processes': not no_orphans(),
+        'decoy untouched': alive(decoy) is True,
+    }
+    failed = {k: v for k, v in r.items() if v is not True}
+    if failed:
+        failed['output'] = repr(t[-300:])
+    record('caddy exiting immediately is reported and nothing else starts', not failed, failed)
 
 
 @scenario
@@ -820,7 +844,8 @@ def signalled_directly():
     every rarer signal whose default action would end serve outright."""
     results = {}
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGALRM, signal.SIGUSR1, signal.SIGUSR2,
-                signal.SIGVTALRM, signal.SIGPROF, signal.SIGXCPU, signal.SIGXFSZ):
+                signal.SIGVTALRM, signal.SIGPROF, signal.SIGXCPU, signal.SIGXFSZ,
+                signal.SIGABRT, signal.SIGEMT, signal.SIGSYS):
         sh = Shell()
         decoy = start_serve(sh, 'A')
         sh.wait('Local: http://', 10)
@@ -1044,6 +1069,40 @@ def output_reader_exits():
 
 
 @scenario
+def piped_into_tee():
+    """The way to keep serve's output (the tunnel URL, say) while it keeps
+    running: hand it to a reader that never leaves early. Everything must
+    stay up while cloudflared keeps logging into the pipe, the saved output
+    must be plain text (no colour codes outside a terminal), and Ctrl-C must
+    still stop the whole pipeline without leaving anything behind."""
+    log = os.path.join(WS.root, 'tee.log')
+    chatty = WS.stub_dir('cf-chatty', {'caddy': None, 'cloudflared': WS.STUB_CF_CHATTY})
+    sh = Shell()
+    decoy = start_serve(sh, 'A', path_prefix=chatty, args=f'--share |& tee "{log}"')
+    sh.wait('Local: http://', 10)
+    time.sleep(2.5)   # past the stub's second log line, written into the pipe
+    port = local_port(sh)
+    saved = open(log).read() if os.path.exists(log) else ''
+    r = {
+        'still serving': bool(port) and get('A', port) is True,
+        'cloudflared still running': bool(cf_pids()),
+        'serve still running': exit_code(sh) is None,
+        'log has the serving line': f'Serving: {WS.site("A")}' in saved,
+        'log has the tunnel output': 'still logging' in saved,
+        'no colour codes in the log': '\x1b[' not in saved,
+        'no colour codes on the terminal either': b'\x1b[1;31m' not in sh.raw_bytes(),
+    }
+    sh.send('\x03')
+    sh.wait(r'EXIT=\d+', 15)
+    sh.finish()
+    time.sleep(0.5)
+    r['no leftover processes'] = not no_orphans()
+    r['decoy untouched'] = alive(decoy) is True
+    failed = {k: v for k, v in r.items() if v is not True}
+    record('piped into tee: keeps serving, logs plain text, stops cleanly', not failed, failed)
+
+
+@scenario
 def refuses_without_a_tty():
     # Not a pty shell, so it is registered by hand for the ownership sampler:
     # otherwise a caddy started here would never be recognised as ours
@@ -1084,6 +1143,7 @@ SCENARIOS = [
     missing_helper_commands,
     helper_misbehaves_at_run_time,
     output_reader_exits,
+    piped_into_tee,
     refuses_without_a_tty,
 ]
 

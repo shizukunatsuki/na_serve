@@ -29,7 +29,7 @@ serve --help     # 打印用法
 
 ```
 $ serve --share
-Serving: /Users/you/some/dir          ← 红色粗体，提醒当前暴露的是哪个目录
+Serving: /Users/you/some/dir          ← 红色粗体（输出到终端时），提醒当前暴露的是哪个目录
 Local: http://your-mac.local:61234/
 2026-... INF |  https://random-words-here.trycloudflare.com  |
 ```
@@ -84,24 +84,29 @@ Local: http://your-mac.local:61234/
   进程组。调用它的交互 shell 会把脚本作为前台 job 放进独立的进程组，脚本内部不开
   job control，caddy 和 cloudflared 因此留在同一个组里。`kill -0` 只用来探测进程或
   进程组是否存在，从不用来发送信号，所以即使某个 PID 在极端情况下被系统回收复用，
-  也不会误杀到无关进程。
+  也不会误杀到无关进程。唯一的"同组外人"是 shell 放进同一个 job 的东西：`serve` 在
+  管道里运行时（如 `serve |& tee serve.log`），管道里的其他命令也在这个组里，会随
+  `serve` 一起收到停止信号——它们本来就是这次运行的一部分，不会波及组外的任何进程。
 - **不是组长就拒绝启动**（例如没有终端时）。是不是组长用 `kill -0 -$$` 直接问内核：
   以自己 PID 为 ID 的进程组存在，当且仅当自己是它的组长。不解析也不信任 `ps` 的
   输出——误判成组长的话，后面所有 `kill -$$` 都会落空，服务就全成了孤儿。
 - **什么情况下会停**：`Ctrl-C`、`Ctrl-\`、关闭终端（HUP）、父 shell 被杀、`Ctrl-Z` 后
   父 shell 被杀，都会在几秒内干净地停掉 Caddy 和 cloudflared（如果开了）；任何一个服务
   自己崩溃，也会带着另一个一起收尾。外部单独发给 `serve` 的信号同理：除了
-  `TERM`/`HUP`，`USR1`、`USR2`、`ALRM`、`VTALRM`、`PROF`、`XCPU`、`XFSZ` 这些默认会直接
-  结束进程的少见信号也都被 trap，照常收尾。输出管道的读端提前退出时，`serve` 或服务
+  `TERM`/`HUP`，`USR1`、`USR2`、`ALRM`、`VTALRM`、`PROF`、`XCPU`、`XFSZ`、`ABRT`、`EMT`、
+  `SYS` 这些默认会直接结束进程的少见信号也都被 trap，照常收尾。输出管道的读端提前退出时，`serve` 或服务
   下一次往管道里写东西就会发现并收尾；在那之前什么都不写的话（例如
   `serve | head -2`），它会作为前台任务继续运行，`Ctrl-C` 照常停止。
 - **收尾一定会执行**：从启动 caddy 到主循环结束的整段代码包在 zsh 的
   `{ ... } always { 收尾 }` 里，无论这段怎么结束，收尾都会跑。这防的是一类不经过
-  普通信号的退出：输出被接进管道、读的一方先退出（例如
-  `serve --share 2>&1 | grep -m1 trycloudflare`），之后 `serve` 再打印任何东西都会写到
-  断掉的管道上——未处理的 `SIGPIPE` 会当场杀死 `serve`（所以它和 `Ctrl-C` 一样被 trap），
-  而即便 trap 了，zsh 也会把这次写失败当成致命错误直接中止脚本。两者都会跳过收尾，
-  让 caddy 失去父进程继续提供目录。
+  普通信号的退出：输出被接进管道、读的一方先退出（例如 `serve 2>&1 | head -3`），
+  之后 `serve` 再打印任何东西都会写到断掉的管道上——未处理的 `SIGPIPE` 会当场杀死
+  `serve`（所以它和 `Ctrl-C` 一样被 trap），而即便 trap 了，zsh 也会把这次写失败当成
+  致命错误直接中止脚本。两者都会跳过收尾，让 caddy 失去父进程继续提供目录。现在的
+  结果是 `serve` 整体停止，这是有意的：读端退出后，caddy 和 cloudflared 下一次写日志
+  也同样会被 `SIGPIPE` 结束。所以想一边留存输出（比如隧道 URL）一边继续提供服务，
+  输出要交给一个不会提前退出的读端，例如 `serve --share |& tee serve.log`，再从
+  `serve.log` 里找 URL。
 - **逐级收尾**：收尾先对整组发 `SIGTERM`。半秒后还没退，几乎总是在等一个没传完的下载
   ——Caddy 的优雅关闭会无限期等下去——于是再发两轮 `SIGINT` + `SIGTERM`。两者都把重复的
   信号当作"立即停止"，但认的不一样：Caddy 只认第二个 `SIGINT`；cloudflared 收到第一个
@@ -114,10 +119,19 @@ Local: http://your-mac.local:61234/
   cloudflared 不会被自动收尾——这是外部对 supervisor 本身动手，不是 `serve` 能在 shell
   层面兜住的场景。这里刻意不加看门狗进程：看门狗自己同样可能被 `SIGKILL`，问题只会
   往下挪一层，还多出一个需要保证不变成孤儿的进程。对整个进程组发 `SIGKILL` 则没有
-  这个问题，所有进程会一起结束。
-- **`serve` 所在的 zsh 自身出错崩溃时**（`SEGV`、`BUS`、`ILL`、`FPE`、`ABRT` 这类故障信号），
-  同样不会收尾。这些信号刻意不 trap：真的出了故障时，trap 之后会回到出错的那条指令上
-  反复触发，只会卡死而不是退出。它们和 `SIGKILL` 一样，超出了脚本能兜住的范围。
+  这个问题，所有进程会一起结束。万一真的发生了，残留进程仍在原来的进程组里，组 ID
+  就是当时 `serve` 的 PID，可以一次清掉：
+
+  ```bash
+  pgrep -lf 'caddy file-server|cloudflared tunnel --url'   # 看有没有残留
+  ps -o pid,pgid,args -p <PID>                                # 查它的进程组
+  kill -TERM -<PGID>                                          # 按组结束
+  ```
+- **`serve` 所在的 zsh 自身出错崩溃时**（`SEGV`、`BUS`、`ILL`、`FPE`、`TRAP` 这类故障信号），
+  同样不会收尾。这些信号刻意不 trap：真的出了故障时，handler 返回后会重新执行出错的
+  那条指令、再次触发，只会卡死而不是退出。它们和 `SIGKILL` 一样，超出了脚本能兜住的
+  范围。`ABRT`、`SYS`、`EMT` 不属于这一类，已经 trap：`abort()` 在 trap 返回后照样会
+  结束进程，非法系统调用只会返回 `ENOSYS`，都不会卡住。
 - **`LocalHostName` 没设置时**，就没有 `.local` 名字可打印：`Local:` 那行会退化成
   `http://localhost:PORT/` 并注明原因，服务本身照常运行。
 
