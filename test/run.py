@@ -12,7 +12,7 @@ Besides what spec.py expects of the case, every case must end with:
 
 and, throughout the run, a bystander serve started before any case must
 keep serving untouched. A case the README says leaves processes behind
-(已知限制) must leave exactly serve's own group behind, and the README's
+(known limitations) must leave exactly serve's own group behind, and the README's
 remedy must clear it.
 
     python3 test/run.py                  # everything, cloudflared stubbed
@@ -218,7 +218,7 @@ class World:
         cmds = fx.commands(procs)
         return ', '.join(f'{pid} {cmds.get(pid, "?")[:60]}' for pid in procs) or 'none'
 
-    # -- business (输出, 启动 4-6, 安全, 进程边界)
+    # -- business (README: output, startup steps 4-6, security, process boundary)
 
     def business(self, t, stdout_tty=True, host=None, via_tunnel=False):
         """Everything the README says holds while serve is up; returns the port."""

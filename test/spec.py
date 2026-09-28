@@ -33,12 +33,12 @@ import signal
 MODES = ('lan', 'share')
 BEHAVIOURS = {'lan': ('idle', 'draining'), 'share': ('idle', 'draining', 'stubborn')}
 
-# 什么时候停止: the stop signals, in the README's order
+# When serve stops (README): the stop signals, in the README's order
 STOP_SIGNALS = 'INT HUP TERM QUIT PIPE ALRM USR1 USR2 VTALRM PROF XCPU XFSZ ABRT EMT SYS'.split()
-# 什么时候停止 / 其他信号
+# When serve stops / other signals (README)
 PAUSE_SIGNALS = 'TSTP TTIN TTOU STOP'.split()
 NO_EFFECT_SIGNALS = 'CHLD WINCH URG IO INFO'.split()
-# 已知限制: SIGKILL and the fatal signals serve does not catch
+# Known limitations (README): SIGKILL and the fatal signals serve does not catch
 FATAL_SIGNALS = 'KILL SEGV BUS ILL FPE TRAP'.split()
 
 # Signals whose default action dumps core. A process ended by one of them
@@ -52,14 +52,14 @@ CORE_SIGNALS = set('QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS'.split())
 STOP_EVENTS = ([('key', '^C'), ('key', '^\\'), ('hangup',)]
                + [('signal', s) for s in STOP_SIGNALS])
 
-# 收尾: how long serve takes from being told to stop to having exited. The
+# Cleanup (README): how long serve takes from being told to stop to having exited. The
 # README gives the schedule (services checked every 0.1 s, a repeat INT+TERM
 # at about 0.5 s and 1 s, SIGKILL at about 5 s); the bounds below allow for
 # that schedule plus scheduling noise, and run.py widens the upper bounds
 # further under parallel load.
 WINDOW = {'idle': (0.0, 1.5), 'draining': (0.0, 2.5), 'stubborn': (4.5, 6.5)}
-PARENT_POLL = 0.5          # 什么时候停止 / 父进程检查
-PORT_WAIT = (9.5, 11.5)    # 启动 5: at most 10 s
+PARENT_POLL = 0.5          # README: when serve stops / parent check
+PORT_WAIT = (9.5, 11.5)    # README: startup step 5, at most 10 s
 
 
 def signum(name):
@@ -96,7 +96,7 @@ class Case:
 
 
 def normal_exit(behaviour):
-    """收尾 / 退出码: a stop ends in the table's code, unless something is
+    """README cleanup / exit codes: a stop ends in the table's code, unless something is
     still running at about 5 s and the whole group is SIGKILLed (137)."""
     return 137 if behaviour == 'stubborn' else 0
 
@@ -106,7 +106,7 @@ def observable(event, nested=False):
     return event not in (('hangup',), ('kill-parent',))
 
 
-# --------------------------------------------------------------------- 参数
+# ------------------------------------------------------------------ arguments
 
 def argument_cases():
     readme = '行为规格 / 参数'
@@ -126,7 +126,7 @@ def argument_cases():
                phase='running', event=('key', '^C'), ends='itself', exit=0)
 
 
-# ---------------------------------------------------------------------- 启动
+# -------------------------------------------------------------------- startup
 
 def dependency_cases():
     readme = '行为规格 / 启动 1'
@@ -192,7 +192,7 @@ def pretrap_cases():
                        printed=False, nothing_started=True, crashes=crashes)
 
 
-# ------------------------------------------------------------ 什么时候停止
+# ------------------------------------------------------------ when serve stops
 
 def running_cases():
     readme = '行为规格 / 什么时候停止'
@@ -216,7 +216,7 @@ def running_cases():
                            phase='running', event=('kill', svc), ends='itself',
                            exit=137 if left == 'stubborn' else 1, window=WINDOW[left],
                            messages=(f'serve: {svc} exited',))
-        # 父进程检查: not during startup; noticed once startup is done
+        # the parent check: not during startup; noticed once startup is done
         yield Case(f'startup/{mode}/kill-parent (nested shell) while waiting for the port',
                    '什么时候停止 / 父进程检查', mode=mode, shims={'caddy': 'slow'}, nested=True,
                    phase='startup', event=('kill-parent',), ends='itself', exit=None,
@@ -269,7 +269,7 @@ def pipe_cases():
                pipe=' 2>&1 >/dev/tty | head -1', phase='none', ends='itself', exit=1, window=(0, 4))
 
 
-# ---------------------------------------------------------------------- 收尾
+# -------------------------------------------------------------------- cleanup
 
 def cleanup_cases():
     readme = '行为规格 / 收尾 1, 5'
@@ -280,7 +280,7 @@ def cleanup_cases():
                    exit=137 if observable(event) else None, window=(lo, hi))
 
 
-# ------------------------------------------------------------------ 已知限制
+# ---------------------------------------------------------- known limitations
 
 def limitation_cases():
     readme = '已知限制'
@@ -301,7 +301,7 @@ def limitation_cases():
                ends='leaks', exit=137, window=(0, 1.0))
 
 
-# ------------------------------------------------------------------- 用法 etc.
+# ------------------------------------------------------------ usage and output
 
 def usage_cases():
     for mode in MODES:
