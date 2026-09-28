@@ -219,6 +219,22 @@ stderr 上还有另外两类输出：
 - **必须是进程组组长才能运行**：所以不能在管道的非首位使用，也不能被没开 job
   control 的脚本当作普通命令调用。
 
+## 测试
+
+[`test/`](test/) 里是端到端测试。它把本 README 的行为规格逐条展开成几百个 case，用
+真实的 caddy 在伪终端里运行 `serve`，并检查每个 case 结束后不留下任何进程：
+
+```bash
+python3 test/run.py
+```
+
+测试会故意让一些进程崩溃，macOS 因此会在 `~/Library/Logs/DiagnosticReports` 里留下
+崩溃报告，有的在运行结束后二三十分钟才写出来，测试脚本不会自动清理。macOS 看起来会
+自动清掉旧报告，但仍建议**跑完后按 [`test/README.md`](test/README.md#副作用崩溃报告)
+的说明手动清理。**
+
+设计和用法见 [`test/README.md`](test/README.md)。
+
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
