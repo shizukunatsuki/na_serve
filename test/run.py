@@ -615,7 +615,7 @@ class Bystander:
     own: no case may disturb it."""
 
     def __init__(self, root, big):
-        self.case = spec.Case('bystander', '进程边界', mode='share')
+        self.case = spec.Case('bystander', 'Process boundary', mode='share')
         self.w = World(self.case, root, big)
         self.t = self.w.open_terminal()
         self.w.term = self.t

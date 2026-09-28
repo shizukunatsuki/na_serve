@@ -109,7 +109,7 @@ def observable(event, nested=False):
 # ------------------------------------------------------------------ arguments
 
 def argument_cases():
-    readme = '行为规格 / 参数'
+    readme = 'Behavior spec / Arguments'
     yield Case('args/--help', readme, kind='args', args='--help', exit=0, stream='stdout', text='usage: serve [--share]')
     yield Case('args/-h', readme, kind='args', args='-h', exit=0, stream='stdout', text='usage: serve [--share]')
     yield Case('args/--help --x', readme, kind='args', args='--help --x', exit=0, stream='stdout', text='usage: serve [--share]')
@@ -129,7 +129,7 @@ def argument_cases():
 # -------------------------------------------------------------------- startup
 
 def dependency_cases():
-    readme = '行为规格 / 启动 1'
+    readme = 'Behavior spec / Startup, step 1'
     for mode in MODES:
         needed = ('caddy', 'cloudflared', 'scutil', 'lsof') if mode == 'share' else ('caddy', 'scutil', 'lsof')
         for cmd in needed:
@@ -140,13 +140,13 @@ def dependency_cases():
 
 def hostname_cases():
     for mode in MODES:
-        yield Case(f'startup/{mode}/LocalHostName not set', '行为规格 / 启动 2; 输出 / Local', mode=mode,
+        yield Case(f'startup/{mode}/LocalHostName not set', 'Behavior spec / Startup, step 2; Output / Local:', mode=mode,
                    shims={'scutil': 'fails'}, phase='running', event=('key', '^C'), ends='itself', exit=0,
                    host='localhost')
 
 
 def leader_cases():
-    readme = '行为规格 / 启动 3'
+    readme = 'Behavior spec / Startup, step 3'
     yield Case('startup/not group leader: true | serve', readme, kind='leader', how='pipeline',
                exit=1, messages=('serve: not a process group leader, refusing to start',))
     yield Case('startup/not group leader: plain command in a script', readme, kind='leader', how='script',
@@ -155,7 +155,7 @@ def leader_cases():
 
 
 def port_cases():
-    readme = '行为规格 / 启动 5'
+    readme = 'Behavior spec / Startup, step 5'
     for mode in MODES:
         yield Case(f'startup/{mode}/caddy exits at once', readme, mode=mode, shims={'caddy': 'exits'},
                    phase='none', ends='itself', exit=1, window=(0, 2), messages=('serve: caddy failed to start',),
@@ -178,7 +178,7 @@ def port_cases():
 
 
 def pretrap_cases():
-    readme = '什么时候停止 / 启动前的信号'
+    readme = 'When it stops / Signals before startup'
     for mode in MODES:
         for event in STOP_EVENTS:
             name = {'^C': 'INT', '^\\': 'QUIT'}.get(event[1]) if event[0] == 'key' else \
@@ -195,7 +195,7 @@ def pretrap_cases():
 # ------------------------------------------------------------ when serve stops
 
 def running_cases():
-    readme = '行为规格 / 什么时候停止'
+    readme = 'Behavior spec / When it stops'
     for mode in MODES:
         for b in BEHAVIOURS[mode]:
             events = STOP_EVENTS + [('group', s) for s in ('TERM', 'INT', 'HUP', 'QUIT')]
@@ -218,13 +218,13 @@ def running_cases():
                            messages=(f'serve: {svc} exited',))
         # the parent check: not during startup; noticed once startup is done
         yield Case(f'startup/{mode}/kill-parent (nested shell) while waiting for the port',
-                   '什么时候停止 / 父进程检查', mode=mode, shims={'caddy': 'slow'}, nested=True,
+                   'When it stops / Parent check', mode=mode, shims={'caddy': 'slow'}, nested=True,
                    phase='startup', event=('kill-parent',), ends='itself', exit=None,
                    window=(1.0, 2.0 + WINDOW['idle'][1] + PARENT_POLL), printed=True)
 
 
 def other_signal_cases():
-    readme = '什么时候停止 / 其他信号'
+    readme = 'When it stops / Other signals'
     for mode in MODES:
         for phase in ('startup', 'running'):
             shims = {'caddy': 'slow'} if phase == 'startup' else {}
@@ -237,7 +237,7 @@ def other_signal_cases():
 
 
 def ctrl_z_cases():
-    readme = '什么时候停止 / Ctrl-Z'
+    readme = 'When it stops / Ctrl-Z'
     for mode in MODES:
         yield Case(f'startup/{mode}/^Z then fg', readme, mode=mode, shims={'caddy': 'slow'},
                    phase='startup', event=('key', '^Z'), ends='continues', then='fg', exit=0)
@@ -251,7 +251,7 @@ def ctrl_z_cases():
 
 
 def pipe_cases():
-    readme = '输出; 什么时候停止 / 输出管道的读端提前退出; 进程边界'
+    readme = 'Output; When it stops / Output pipe reader exits early; Process boundary'
     for mode in MODES:
         yield Case(f'output/{mode}/| cat (plain text, no colour)', readme, mode=mode, pipe=' | cat',
                    phase='running', event=('key', '^C'), ends='itself', exit=0, stdout_tty=False)
@@ -272,7 +272,7 @@ def pipe_cases():
 # -------------------------------------------------------------------- cleanup
 
 def cleanup_cases():
-    readme = '行为规格 / 收尾 1, 5'
+    readme = 'Behavior spec / Cleanup, steps 1 and 5'
     lo, hi = WINDOW['stubborn']
     for event in (STOP_EVENTS + [('group', s) for s in ('TERM', 'INT', 'HUP', 'QUIT')] + [('kill-parent',)]):
         yield Case(f'cleanup/share/stubborn/{event_id(event)} during cleanup', readme, mode='share',
@@ -283,7 +283,7 @@ def cleanup_cases():
 # ---------------------------------------------------------- known limitations
 
 def limitation_cases():
-    readme = '已知限制'
+    readme = 'Known limitations'
     for mode in MODES:
         for phase in ('startup', 'running'):
             shims = {'caddy': 'slow'} if phase == 'startup' else {}
@@ -305,13 +305,13 @@ def limitation_cases():
 
 def usage_cases():
     for mode in MODES:
-        yield Case(f'usage/{mode}/three instances at once', '用法', kind='concurrency', mode=mode)
-        yield Case(f'output/{mode}/streams', '输出', kind='streams', mode=mode)
+        yield Case(f'usage/{mode}/three instances at once', 'Usage', kind='concurrency', mode=mode)
+        yield Case(f'output/{mode}/streams', 'Output', kind='streams', mode=mode)
 
 
 def tunnel_cases():
     """--real-tunnel only: the few cases worth a real quick tunnel."""
-    readme = '输出; 参数; 收尾 4'
+    readme = 'Output; Arguments; Cleanup, step 4'
     yield Case('tunnel/real/business, Ctrl-C', readme, mode='share', shims={'cloudflared': 'real'},
                phase='running', event=('key', '^C'), ends='itself', exit=0, window=(0, 3))
     for event in (('key', '^C'), ('signal', 'TERM')):
