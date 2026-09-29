@@ -68,6 +68,10 @@ STALL_NOTE = ('  [a whole-machine stall can also cause this: a longest fixture g
 LEFTOVER_WAIT = spec.LEFTOVER + MARGIN
 # ... and when serve has only just been told to stop (CLEAN-1 first)
 STOP_AND_LEFTOVER_WAIT = spec.WINDOW['idle'][1] + spec.LEFTOVER + 2 * MARGIN
+# How long serve may take to print its block: caddy's start (15 s is ample),
+# and with --share the tunnel's address too, which PUB-3 lets take up to
+# PUBLIC_GIVE_UP from cloudflared's start. Only a failing case waits this long
+STARTUP_WAIT = 15 + spec.PUBLIC_GIVE_UP[1] + 1
 DECOY_LIFETIME = 300          # far longer than any case; finite if a run crashes
 
 
@@ -297,8 +301,7 @@ class World:
         # stdout alone, by the streams case)
         self.check(re.search(r'Serving: ' + re.escape(self.site) + r'$', text, re.M) is not None
                    or [l for l in text.splitlines() if 'Serving' in l], 'Serving: names the directory')
-        self.check((fx.RED + b'Serving: ' in raw) == stdout_tty,
-                   'Serving: in bold red exactly when stdout is a terminal')
+        self.check_styles(raw, stdout_tty)
         caddy = self.ledger.entries('caddy')
         self.check(len(caddy) == 1 or f'{len(caddy)} launched', 'caddy launched once')
         if caddy:
@@ -323,8 +326,6 @@ class World:
             if logged and shown:
                 self.check(shown.group(1) == f'https://{logged.group(1)}/' or shown.group(1),
                            'Public: shows this instance\'s tunnel address')
-            self.check((fx.RED + b'Public:  https://' in t.raw[self.mark:]) == stdout_tty,
-                       'Public: in bold red exactly when stdout is a terminal')
             self.tunnel = shown.group(1).rstrip('/') if shown else None
             if cf:
                 # where the tunnel forwards to must be this instance, serving
@@ -343,10 +344,25 @@ class World:
             self.check(not cf or f'{len(cf)} launched', 'no cloudflared without --share')
         return port
 
+    def check_styles(self, raw, tty):
+        """OUT-2, on the block's lines as they reached the terminal."""
+        lines = [line for line in raw.split(b'\n')
+                 if re.search(rb'Serving:|Local:|Public:|\xe2\x94\x80 serve \xe2', line)]
+        if not tty:
+            self.check(all(b'\x1b[' not in line for line in lines) or lines, 'no control sequences off a terminal')
+            return
+        want = [fx.DIM + '──'.encode(), fx.DIM + b'Serving:', fx.BOLD + self.site.encode(), fx.DIM + b'Local:',
+                fx.UNDERLINE + b'http://']
+        if self.case.mode == 'share':
+            want.append(fx.YELLOW + b'Public:')
+        joined = b'\n'.join(lines)
+        self.check([w.decode() for w in want if w not in joined] or True, 'the block\'s styles on a terminal')
+        self.check(b'31m' not in joined or joined, 'no red in the block')
+
     def stub_note(self, what, timeout):
         """When this case's (only) cloudflared started ('start', per the
-        kernel), or its stand-in had its address ready ('ready'): seconds
-        since the epoch, or None."""
+        kernel), or its stand-in was about to log for the first time ('log')
+        or had its address ready ('ready'): seconds since the epoch, or None."""
         got = []
         if what == 'start':
             fx.wait_until(lambda: self.ledger.first('cloudflared'), timeout)
@@ -397,13 +413,12 @@ def run_lifecycle(w):
         fx.wait_until(lambda: w.ledger.first('caddy'), 5)
         w.serve_identity()
     elif c.phase == 'addrwait':
-        if not t.expect(r'Local:\s+http://', 15, w.mark):
-            raise Failed('serve never finished starting')
-        w.check(w.stub_note('start', 5) is not None, 'cloudflared started')
+        w.check(w.stub_note('start', 15) is not None, 'cloudflared started')
         fx.sleep(1.0)
+        w.check('Serving:' not in t.text(w.mark), 'nothing on stdout yet')
         w.serve_identity()
     elif c.phase in ('running', 'cleanup'):
-        if not t.expect(r'Local:\s+http://', 15, w.mark):
+        if not t.expect(r'Local:\s+http://', STARTUP_WAIT, w.mark):
             raise Failed('serve never finished starting')
         if c.mode == 'share':
             fx.wait_until(lambda: w.ledger.first('cloudflared'), 5)
@@ -439,8 +454,8 @@ def run_lifecycle(w):
     if ends == 'itself':
         lo, hi = e.get('window', (0, 3))
         t_ref = w.t0 if c.phase == 'none' else t_event
-        if e.get('since') == 'address':
-            t_ref = w.stub_note('ready', 10) or w.t0
+        if e.get('since'):
+            t_ref = w.stub_note(e['since'], 10) or w.t0
         gone, dt, source = True, None, None
         w.timeline = []
         if w.serve or w.serve_identity(timeout=0.5):
@@ -474,7 +489,9 @@ def run_lifecycle(w):
         if e.get('printed') is False:
             w.check('Serving:' not in t.text(w.mark), 'nothing printed yet')
         if e.get('serving'):
-            port = local_port(t, w)
+            caddy = w.ledger.first('caddy')
+            socks = fx.listening(caddy.pid) if caddy else []
+            port = int(socks[0].rsplit(':', 1)[1]) if socks else None
             w.check(port is not None and fx.http_get(f'http://127.0.0.1:{port}/who.txt') == w.content.encode(),
                     'still serving')
         then = e['then']
@@ -495,7 +512,7 @@ def run_lifecycle(w):
             t.run('fg')
         if then in ('resume', 'fg', 'ctrl-c') and c.phase in ('pretrap', 'startup', 'running') \
                 and e.get('printed') is not False:
-            m = t.expect(r'Local:\s+http://(\S+?):\d+/', 15, w.mark)
+            m = t.expect(r'Local:\s+http://(\S+?):\d+/', STARTUP_WAIT, w.mark)
             if not m:
                 w.check(False, 'serve finishes starting / keeps running')
             elif e.get('host'):
@@ -649,63 +666,52 @@ def stop_with_ctrl_c(w, t, want_exit):
     w.check(w.timed_clean('clean_after') or w.describe(w.leftovers()), 'nothing left behind')
 
 
-# PUB-1's summary: Serving:, Local: and Public: together
-PUBLIC_BLOCK = re.compile(r'\n\n[^\n]*━+ serve ━+[^\n]*\n  Serving: ([^\n]*)\n  Local:   ([^\n]*)\n'
-                          r'  Public:  (\S+)\n━+\n')
-GIVE_UP = "serve: could not read the public address; look for it in cloudflared's log"
+# OUT-1's block with --share: the Public: line is the address (PUB-1) or says
+# there is none (PUB-3)
+SHARE_BLOCK = re.compile(r'\n\n[^\n]*─+ serve ─+[^\n]*\n  Serving: ([^\n]*)\n  Local:   ([^\n]*)\n'
+                         r'  Public:  ([^\n]*)\n─+\n')
+NO_ADDRESS = "unknown, look for it in cloudflared's log"
 
 
 def run_public(w):
-    """PUB-1 (the address, shown in time, once) and PUB-3 (no usable address:
-    said so in time, nothing shown, still serving)."""
+    """PUB-1 (the address, shown in time, in serve's one block) and PUB-3 (no
+    usable address: the block says so, in time, and serve keeps serving)."""
     address = w.case.shims['address']
     t = w.term = w.open_terminal()
     w.launch(t)
-    if not t.expect(r'Local:\s+http://', 15, w.mark):
-        raise Failed('serve never finished starting')
-    port = local_port(t, w)
-    start = w.stub_note('start', 5)
+    start = w.stub_note('start', 15)
     w.check(start is not None, 'cloudflared started')
     if address in ('ok', 'late'):
-        ready = w.stub_note('ready', 10)
-        w.check(ready is not None, 'the address became available')
-        m = t.expect(r'Public:\s+\S+\n', spec.PUBLIC + MARGIN + 5, w.mark)
-        seen = time.time()
-        w.check(bool(m), 'Public: line printed')
-        if m and ready:
-            dt = seen - ready
-            w.measured['public'] = round(dt, 3)
-            w.check(dt <= spec.PUBLIC + MARGIN or f'{dt:.2f}s after the address was ready, want 0-{spec.PUBLIC}; '
-                    f'longest fixture gap so far {fx.MAX_GAP[0]:.2f}s' + STALL_NOTE, 'Public: shown in time')
-        fx.sleep(2.0)
-        text = t.text(w.mark)
-        block = PUBLIC_BLOCK.search(text)
-        logged = re.search(TUNNEL_LOGGED, text)
-        w.check(bool(block) or text[-600:], 'an empty line and the five-line summary block')
-        if block:
-            first = re.search(r'Local:   ([^\n]*)\n', text)
-            w.check(block.group(1) == w.site or block.group(1), 'the summary names the directory')
-            w.check(bool(first) and block.group(2) == first.group(1) or block.group(2),
-                    'the summary repeats the Local: address')
-        if block and logged:
-            w.check(block.group(3) == f'https://{logged.group(1)}/' or block.group(3),
-                    'Public: shows this instance\'s tunnel address')
-        w.check(text.count('Public:') == 1 or text.count('Public:'), 'Public: shown once')
+        ref, (lo, hi), what = w.stub_note('ready', 10), (0.0, spec.PUBLIC), 'after the address was ready'
+        w.check(ref is not None, 'the address became available')
     else:
-        m = t.expect(re.escape(GIVE_UP), spec.PUBLIC_GIVE_UP[1] + MARGIN + 5, w.mark)
-        seen = time.time()
-        w.check(bool(m), f'message "{GIVE_UP}"')
-        if m and start:
-            dt = seen - start
-            lo, hi = spec.PUBLIC_GIVE_UP
-            w.measured['give_up'] = round(dt, 3)
-            w.check(lo <= dt <= hi + MARGIN or f'{dt:.2f}s after cloudflared started, want {lo}-{hi}; '
-                    f'longest fixture gap so far {fx.MAX_GAP[0]:.2f}s' + STALL_NOTE, 'serve gives up in time')
-        text = t.text(w.mark)
-        w.check('Public:' not in text, 'no Public: line')
-        w.check(b'\x1b[31m x.trycloudflare' not in t.raw[w.mark:], 'nothing of what was read is written')
-        w.check(port is not None and fx.http_get(f'http://127.0.0.1:{port}/who.txt') == w.content.encode(),
-                'still serving')
+        ref, (lo, hi), what = start, spec.PUBLIC_GIVE_UP, 'after cloudflared started'
+    m = t.expect(r'Public:  [^\n]*\n', (ref or time.time()) - time.time() + hi + MARGIN + 5, w.mark)
+    seen = time.time()
+    if not m:
+        raise Failed('the block never came')
+    if ref:
+        dt = seen - ref
+        w.measured['public' if lo == 0 else 'give_up'] = round(dt, 3)
+        w.check(lo <= dt <= hi + MARGIN or f'{dt:.2f}s {what}, want {lo}-{hi}; '
+                f'longest fixture gap so far {fx.MAX_GAP[0]:.2f}s' + STALL_NOTE, 'the block comes in time')
+    fx.sleep(2.0)
+    text = t.text(w.mark)
+    block = SHARE_BLOCK.search(text)
+    w.check(bool(block) or text[-600:], 'an empty line and the block, Public: included')
+    w.check(text.count('Serving:') == 1 or text.count('Serving:'), 'one block, written once')
+    if block:
+        w.check(block.group(1) == w.site or block.group(1), 'Serving: names the directory')
+        if address in ('ok', 'late'):
+            logged = re.search(TUNNEL_LOGGED, text)
+            w.check(bool(logged) and block.group(3) == f'https://{logged.group(1)}/' or block.group(3),
+                    'Public: shows this instance\'s tunnel address')
+        else:
+            w.check(block.group(3) == NO_ADDRESS or block.group(3), 'Public: says there is no address')
+    w.check(b'\x1b[31m x.trycloudflare' not in t.raw[w.mark:], 'nothing of what was read is written, but a host name')
+    port = local_port(t, w)
+    w.check(port is not None and fx.http_get(f'http://127.0.0.1:{port}/who.txt') == w.content.encode(),
+            'serving')
     stop_with_ctrl_c(w, t, 0)
 
 
@@ -759,7 +765,7 @@ def concurrency(w):
         t.mark0 = t.mark()
         t.run(f'PATH={fx.q(w.shims)} {fx.q(fx.SERVE)} {w.case.args}')
     for t in w.terms:
-        m = t.expect(r'Local:\s+http://\S+?:(\d+)/', 15, t.mark0)
+        m = t.expect(r'Local:\s+http://\S+?:(\d+)/', STARTUP_WAIT, t.mark0)
         ports.append(int(m.group(1)) if m else None)
     w.check(None not in ports and len(set(ports)) == 3 or str(ports), 'three instances, three ports')
     if w.case.mode == 'share':
@@ -791,39 +797,31 @@ def concurrency(w):
 def run_streams(w):
     t = w.term = w.open_terminal()
     w.launch(t, pipe=' 2>/dev/null')
-    ok = t.expect(r'Local:\s+http://', 15, w.mark)
+    ok = t.expect(r'Local:\s+http://', STARTUP_WAIT, w.mark)
     w.check(bool(ok), 'Serving:/Local: on stdout')
-    if w.case.mode == 'share':
-        w.check(bool(t.expect(r'Public:\s+https://', spec.PUBLIC + MARGIN + 5, w.mark)), 'Public: on stdout')
     fx.sleep(1.5)
     quiet = t.text(w.mark)
     # past the echo of the command line itself, stdout holds exactly an empty
-    # line and the four-line block
+    # line and the block (with --share, its Public: line included)
     lines = quiet.splitlines()[1:]
     while lines and not lines[-1].strip():
         lines.pop()
+
     def frame(line, titled):
-        return (' serve ' in line and set(line) <= set(' serve━')) if titled else set(line) == {'━'}
-    ok = (len(lines) >= 5 and lines[0] == '' and frame(lines[1], True)
+        return (' serve ' in line and set(line) <= set(' serve─')) if titled else set(line) == {'─'}
+    share = w.case.mode == 'share'
+    ok = (len(lines) == (6 if share else 5) and lines[0] == '' and frame(lines[1], True)
           and lines[2] == f'  Serving: {w.site}' and re.match(r'  Local:   http://\S+/$', lines[3]) is not None
-          and frame(lines[4], False))
-    if w.case.mode == 'share':
-        ok = ok and len(lines) == 11 and lines[5] == '' and frame(lines[6], True) \
-            and lines[7:9] == lines[2:4] \
-            and re.fullmatch(r'  Public:  https://[a-z0-9-]+\.trycloudflare\.com/', lines[9]) is not None \
-            and frame(lines[10], False)
-        what = 'stdout holds exactly the serve block and then the summary block, each after an empty line'
-    else:
-        ok = ok and len(lines) == 5
-        what = 'stdout holds exactly the empty line and the serve block'
-    w.check(ok or lines, what)
+          and (not share or re.fullmatch(r'  Public:  https://[a-z0-9-]+\.trycloudflare\.com/', lines[4]))
+          and frame(lines[-1], False))
+    w.check(ok or lines, 'stdout holds exactly the empty line and the serve block')
     t.send(KEYS['^C'])
     w.wait_serve_gone(5)
     w.serve = None
     w.ledger = fx.Ledger(w.ledger.path, w.sids)
     fx.sleep(0.5)
     w.launch(t)
-    t.expect(r'Local:\s+http://', 15, w.mark)
+    t.expect(r'Local:\s+http://', STARTUP_WAIT, w.mark)
     fx.sleep(1.5)
     loud = t.text(w.mark)
     w.check('server running' in loud, 'caddy\'s log on the terminal')
@@ -869,13 +867,13 @@ def run_warn(w):
     other, t = w.terms
     other.mark0 = other.mark()
     other.run(f'PATH={fx.q(w.shims)} {fx.q(fx.SERVE)} {w.case.args}')
-    w.check(bool(other.expect(r'Local:\s+http://', 15, other.mark0)), 'the other serve starts')
+    w.check(bool(other.expect(r'Local:\s+http://', STARTUP_WAIT, other.mark0)), 'the other serve starts')
     theirs = [e.pid for e in w.ledger.entries() if e.name in ('caddy', 'cloudflared')]
     w.term = t
     w.launch(t)
-    w.check(bool(t.expect(r'Local:\s+http://', 15, w.mark)), 'serve starts, warning or not')
+    w.check(bool(t.expect(r'Local:\s+http://', STARTUP_WAIT, w.mark)), 'serve starts, warning or not')
     text = t.text(w.mark)
-    block = re.search(r'serve: warning.*?\n(.*?)\n[^\n]*━{10,}', text, re.S)
+    block = re.search(r'serve: warning.*?\n(.*?)\n[^\n]*─{10,}', text, re.S)
     w.check(bool(block), 'a warning block is printed')
     body = block.group(1) if block else ''
     shown = {int(pid): int(pgid) for pid, pgid in re.findall(r'PID (\d+)\s+PGID (\d+)', body)}
@@ -945,7 +943,7 @@ class Bystander:
         self.t = self.w.open_terminal()
         self.w.term = self.t
         self.w.launch(self.t)
-        if not self.t.expect(r'Local:\s+http://\S+?:(\d+)/', 15, self.w.mark):
+        if not self.t.expect(r'Local:\s+http://\S+?:(\d+)/', STARTUP_WAIT, self.w.mark):
             raise SystemExit('bystander serve did not start')
         fx.wait_until(lambda: self.w.ledger.first('cloudflared'), 5)
         self.w.serve_identity()

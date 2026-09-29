@@ -60,7 +60,8 @@ HOST = subprocess.run([REAL_SCUTIL, '--get', 'LocalHostName'],
                       capture_output=True, text=True).stdout.strip()
 
 ANSI = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
-RED = b'\x1b[1;31m'
+# OUT-2's styles
+DIM, BOLD, UNDERLINE, YELLOW = b'\x1b[2m', b'\x1b[1m', b'\x1b[4m', b'\x1b[33m'
 
 
 def q(s):
@@ -317,9 +318,10 @@ SCUTIL = {
 #   'empty'    logged, but the hostname is empty
 #   'bad-host' logged, but the hostname has an escape sequence and a space
 #
-# It also notes, for the fixture's clock, when its address is about to become
-# available (.cloudflared-<PID>.ready next to it): just before, never after,
-# so a time measured from it can only come out longer. When it started is
+# It also notes, for the fixture's clock, when it is about to write its first
+# log line and when its address is about to become available
+# (.cloudflared-<PID>.log and .ready next to it): just before, never after,
+# so a time measured from them can only come out longer. When it started is
 # the kernel's to say (process_start).
 #
 # 'stubborn' is not modelled on cloudflared: it ignores everything a process
@@ -391,6 +393,7 @@ else:
     signal.signal(signal.SIGTERM, graceful)
     signal.signal(signal.SIGINT, graceful)
 
+note('log')
 log('INF Requesting new quick Tunnel on trycloudflare.com...')
 if ADDRESS == 'late':
     time.sleep(3)
@@ -559,11 +562,11 @@ def listening(pid):
 
 
 def stub_notes(directory):
-    """What the cloudflared stand-ins in `directory` noted: PID -> {'ready':
-    time}, in seconds since the epoch."""
+    """What the cloudflared stand-ins in `directory` noted: PID -> {'log':
+    time, 'ready': time}, in seconds since the epoch."""
     out = {}
     for name in os.listdir(directory):
-        m = re.fullmatch(r'\.cloudflared-(\d+)\.(ready)', name)
+        m = re.fullmatch(r'\.cloudflared-(\d+)\.(log|ready)', name)
         if m:
             try:
                 with open(os.path.join(directory, name)) as f:

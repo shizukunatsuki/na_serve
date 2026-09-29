@@ -70,7 +70,8 @@ PIPE_BOTH = (0.0, 2.5)     # PIPE-2, PIPE-3, from serve's start
 PIPE_SERVICE = (0.0, 3.5)  # PIPE-4, from serve's start
 PUBLIC = 1.0               # PUB-1, from the tunnel's address becoming available
 PUBLIC_GIVE_UP = (30.0, 31.5)  # PUB-3, from cloudflared's start
-PIPE_PUBLIC = (0.0, 2.0)   # PIPE-1 with --share, from the address becoming available
+PIPE_PUBLIC = (0.0, 2.0)   # PIPE-2 with --share, from the address becoming available
+PIPE_CF = (0.0, 1.5)       # PIPE-3 with --share, from cloudflared's first log line
 LEFTOVER = 1.0             # PROC-1, PROC-2: how long the last processes may take
 
 
@@ -275,17 +276,17 @@ def pipe_cases():
     for mode in MODES:
         yield Case(f'output/{mode}/| cat (plain text, no colour)', ('OUT-2', 'STOP-1', 'CLEAN-1'), mode=mode, pipe=' | cat',
                    phase='running', event=('key', '^C'), ends='itself', exit=0, stdout_tty=False)
-        if mode == 'lan':
-            yield Case(f'output/{mode}/| head -2 (reader leaves, nothing more is written)', 'PIPE-1', mode=mode,
-                       pipe=' | head -2', phase='none', ends='continues', then='ctrl-c', exit=0, stdout_tty=False)
-        else:
-            yield Case(f'output/{mode}/| head -2 (reader leaves, the summary block finds it gone)', 'PIPE-1',
-                       mode=mode, pipe=' | head -2', phase='none', ends='itself', exit=0, window=PIPE_PUBLIC,
-                       since='address', messages=('write error: broken pipe',))
+        yield Case(f'output/{mode}/| head -2 (reader leaves, nothing more is written)', 'PIPE-1', mode=mode,
+                   pipe=' | head -2', phase='none', ends='continues', then='ctrl-c', exit=0, stdout_tty=False)
+        # with --share, serve's first write to stdout waits for the address
         yield Case(f'output/{mode}/| true (serve writes first)', 'PIPE-2', mode=mode, pipe=' | true',
-                   phase='none', ends='itself', exit=0, window=PIPE_BOTH, messages=('write error: broken pipe',))
+                   phase='none', ends='itself', exit=0, messages=('write error: broken pipe',),
+                   **({'window': PIPE_PUBLIC, 'since': 'ready'} if mode == 'share' else {'window': PIPE_BOTH}))
+        # with --share, serve has nothing to write before the address, and
+        # caddy shrugs off the broken pipe: cloudflared is the one that hits it
         yield Case(f'output/{mode}/|& true (whoever writes first)', 'PIPE-3', mode=mode, pipe=' |& true',
-                   phase='none', ends='itself', exit=(0, 1), window=PIPE_BOTH)
+                   phase='none', ends='itself', exit=(0, 1),
+                   **({'window': PIPE_CF, 'since': 'log'} if mode == 'share' else {'window': PIPE_BOTH}))
         yield Case(f'output/{mode}/|& tee (pipeline peer in the group)', ('OUT-2', 'STOP-1', 'CLEAN-1'), mode=mode, pipe=' |& tee {tee}',
                    phase='running', event=('signal', 'TERM'), ends='itself', exit=0, stdout_tty=False, tee=True)
     # a service hits the dead pipe first: the stub logs again a second in, after
@@ -321,7 +322,7 @@ def limitation_cases():
                    nothing_started=True)
     yield Case('running/share/lsof hangs reading the address', ('LIM-4', 'STOP-1', 'CLEAN-1'), mode='share',
                shims={'lsof': 'hangs-for-cloudflared'}, phase='none', ends='continues', then='ctrl-c', hold=3,
-               exit=0, public=False, serving=True)
+               exit=0, printed=False, public=False, serving=True)
     yield Case('cleanup/share/stubborn/signal:KILL during cleanup skips the rest', 'LIM-3', mode='share',
                behaviour='stubborn', phase='cleanup', event=('key', '^C'), second=('signal', 'KILL'),
                ends='leaks', exit=137, window=QUICK)
@@ -342,7 +343,7 @@ def public_cases():
     for event in STOP_EVENTS:
         yield Case(f'addrwait/share/{event_id(event)} while waiting for the address', ('PUB-4', 'CLEAN-1'),
                    mode='share', shims={'address': 'never'}, phase='addrwait', event=event, ends='itself',
-                   exit=0 if observable(event) else None, window=WINDOW['idle'], public=False)
+                   exit=0 if observable(event) else None, window=WINDOW['idle'], printed=False, public=False)
 
 
 # ------------------------------------------------------------ usage and output

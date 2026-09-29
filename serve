@@ -132,14 +132,14 @@ for line in ${(f)"$(ps -A -ww -o pid=,ppid=,pgid=,command= 2>/dev/null)"}; do
 done
 if (( $#strays )); then
   typeset warn= off=
-  [[ -t 2 ]] && { warn=$'\e[1;33m'; off=$'\e[0m' }
+  [[ -t 2 ]] && { warn=$'\e[33m'; off=$'\e[0m' }
   print -ru2 -- "
-${warn}━━━━━━━━━━━━━━━ serve: warning ━━━━━━━━━━━━━━━━${off}
+${warn}── serve: warning ─────────────────────────────${off}
   These look like services left behind by an earlier serve
   (their parent is gone), and may still expose a directory:
 ${(F)strays}
   If they are, end them with: ${(j:, :)${(@)pgids/#/kill -KILL -}}
-${warn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${off}"
+${warn}───────────────────────────────────────────────${off}"
 fi
 
 {
@@ -191,33 +191,44 @@ fi
     rc=1
   else
     # Anyone on the LAN (and with --share, anyone at all) can read this, with
-    # nothing hidden (dotfiles included), so make it hard to miss among the
-    # services' logs: a framed block (with --share, a second one, with the
-    # public address too, follows once the tunnel has it), the exposed
-    # directory in bold red,
-    # spelled out as escape codes because a non-interactive zsh has no
-    # terminal capabilities for %B. Only on a terminal, though; in a file or
-    # a pipe the codes would just be noise. It goes out in a single write, so
-    # no log line can land inside it, after a newline of its own, so it never
-    # continues a log line that is still being written.
-    typeset bold= red= off= url
-    [[ -t 1 ]] && { bold=$'\e[1m'; red=$'\e[1;31m'; off=$'\e[0m' }
+    # nothing hidden (dotfiles included), so it has to be easy to find among
+    # the services' logs: one framed block, written once. With --share it
+    # waits for the tunnel's address, so that everything is in one place
+    # rather than repeated. Styles only on a terminal (in a file or a pipe the
+    # codes would just be noise), spelled out as escape codes because a
+    # non-interactive zsh has no terminal capabilities for %B, and kept sparse
+    # so that what matters stands out: frame and labels dimmed, the directory
+    # in bold, addresses underlined, and one colour, yellow, for Public:, the
+    # address anyone on the internet can use. The block goes out in a single
+    # write, so no log line can land inside it, after a newline of its own,
+    # so it never continues a log line that is still being written.
+    typeset dim= bold= ul= yellow= off= url note=
+    [[ -t 1 ]] && { dim=$'\e[2m'; bold=$'\e[1m'; ul=$'\e[4m'; yellow=$'\e[33m'; off=$'\e[0m' }
     if [[ -n $host ]]; then
       url="http://${host}.local:${port}/"
     else
-      url="http://localhost:${port}/ (LocalHostName is not set, so there is no .local name)"
+      url="http://localhost:${port}/"
+      note=" (LocalHostName is not set, so there is no .local name)"
     fi
-    print -r -- "
-${bold}━━━━━━━━━━━━━━━━━━━━ serve ━━━━━━━━━━━━━━━━━━━━${off}
-  ${red}Serving: ${PWD}${off}
-  ${bold}Local:${off}   ${url}
-${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${off}"
+    # With --share, $1 is what goes after Public:
+    show() {
+      local extra=
+      (( share )) && extra=$'\n'"  ${yellow}Public:${off}  $1"
+      print -r -- "
+${dim}── serve ──────────────────────────────────────${off}
+  ${dim}Serving:${off} ${bold}${PWD}${off}
+  ${dim}Local:${off}   ${ul}${url}${off}${note}${extra}
+${dim}───────────────────────────────────────────────${off}"
+    }
     if (( share )); then
       cloudflared tunnel --url "http://localhost:${port}" </dev/null &
       cf_pid=$!
       # A quick tunnel usually has its address within seconds; past this,
-      # something is wrong enough to say so rather than keep asking
+      # something is wrong enough to show the block without it rather than
+      # keep the LAN address back any longer
       public_deadline=$(( SECONDS + 30 ))
+    else
+      show
     fi
 
     # Run until interrupted, a service exits, or the parent shell dies. A
@@ -253,20 +264,13 @@ ${bold}━━━━━━━━━━━━━━━━━━━━━━━━�
           [[ $body == *'"hostname":"'* ]] || continue
           public=${${body#*\"hostname\":\"}%%\"*}
           if [[ -n $public && ${#public} -le 253 && $public != *[^A-Za-z0-9.-]* ]]; then
-            # Everything in one place, since the first block has scrolled
-            # away under the tunnel's logs by now
-            print -r -- "
-${bold}━━━━━━━━━━━━━━━━━━━━ serve ━━━━━━━━━━━━━━━━━━━━${off}
-  ${red}Serving: ${PWD}${off}
-  ${bold}Local:${off}   ${url}
-  ${red}Public:  https://${public}/${off}
-${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${off}"
+            show "${ul}https://${public}/${off}"
             public_deadline=0
             break
           fi
         done
         if (( public_deadline && SECONDS >= public_deadline )); then
-          print -u2 "serve: could not read the public address; look for it in cloudflared's log"
+          show "unknown, look for it in cloudflared's log"
           public_deadline=0
         fi
       fi

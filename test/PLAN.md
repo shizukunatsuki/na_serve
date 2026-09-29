@@ -29,7 +29,7 @@
 | 疑似残留 | 命令行和 `serve` 启动服务时的一样（`caddy file-server --browse --listen :0`，或 `cloudflared tunnel --url http://localhost:<端口>`，前面可以带路径），并且父进程是 launchd（PID 1）的进程 |
 | 后代 | `serve` 直接或间接启动的所有进程：服务、辅助命令，以及它们再启动的进程 |
 | 管道同伴 | shell 和 `serve` 放在同一个作业里的其他命令，如 `serve \|& tee log` 里的 `tee`。它们和 `serve` 同一个进程组，但不是它的后代 |
-| 启动完成 | `serve` 打印出 `Local:` 行的时刻 |
+| 启动完成 | `serve` 在 stdout 上写出 OUT-1 的块的时刻。`--share` 时要等到公网地址读到了，或者确定读不到了（PUB-1、PUB-3） |
 | 公网地址 | 本实例的 cloudflared 在自己日志里给出的隧道地址（`https://<主机名>`），也就是它在本机的 metrics 端口上用 `/quicktunnel` 报告的主机名。同一台机器上别的进程（包括别的 cloudflared）报告的地址都不是 |
 | 可用的主机名 | 只由字母、数字、`-` 和 `.` 组成、不超过 253 个字符的主机名 |
 | 停止事件 | 终端上的 `Ctrl-C`、`Ctrl-\`，关闭终端，或单独发给 `serve` 的停止信号：`INT` `HUP` `TERM` `QUIT` `PIPE` `ALRM` `USR1` `USR2` `VTALRM` `PROF` `XCPU` `XFSZ` `ABRT` `EMT` `SYS` |
@@ -61,12 +61,12 @@
 
 ### 输出与服务
 
-- **OUT-1** stdout 上先是一个空行，加上一个四行的块：含有 `serve` 字样的上边框、
-  `  Serving: <当前目录的绝对路径>`、`  Local:   <地址>`、下边框。不带 `--share` 时，
-  stdout 上只有这些；带 `--share` 时，之后只可能再有 PUB-1 的汇总块。服务和 cloudflared 的
-  日志只出现在 stderr 上。
-- **OUT-2** stdout 是终端时，`Serving:` 行和 `Public:` 行是红色粗体（`ESC[1;31m`）；不是
-  终端时，stdout 上不带任何控制序列。
+- **OUT-1** stdout 上恰好是一个空行，加上一个块，整个运行期间只写一次：含有 `serve`
+  字样的上边框、`  Serving: <当前目录的绝对路径>`、`  Local:   <地址>`、（仅 `--share`）
+  `  Public:  <见 PUB-1、PUB-3>`、下边框。服务和 cloudflared 的日志只出现在 stderr 上。
+- **OUT-2** stdout 是终端时，块里只用这几种样式：边框和 `Serving:`、`Local:` 两个标签为
+  暗色（`ESC[2m`），目录为粗体（`ESC[1m`），地址带下划线（`ESC[4m`），`Public:` 标签为
+  黄色（`ESC[33m`）；不用红色。不是终端时，stdout 上不带任何控制序列。
 - **OUT-3** `Local:` 的地址是 `http://<LocalHostName>.local:<端口>/`。读不到 LocalHostName 时
   改为 `http://localhost:<端口>/`，并在同一行注明 `LocalHostName is not set`。
 - **OUT-4** `--share` 时，cloudflared 日志里的隧道地址原样出现在 stderr 上。
@@ -87,19 +87,19 @@
 
 ### 公网地址
 
-- **PUB-1** `--share` 时，cloudflared 报告出公网地址后 1 秒内，`serve` 在 stdout 上写出
-  一个空行，加上一个五行的汇总块：含有 `serve` 字样的上边框、和 OUT-1 相同的 `Serving:`
-  行与 `Local:` 行、`  Public:  https://<主机名>/`、下边框。地址就是本实例的公网地址；cloudflared 过一段时间才报告时（例如几秒后），也照样
-  写出。整个运行期间只写一次。
+- **PUB-1** `--share` 时，cloudflared 报告出公网地址后 1 秒内，`serve` 写出 OUT-1 的块，
+  其中 `Public:` 行是 `  Public:  https://<主机名>/`。地址就是本实例的公网地址；
+  cloudflared 过一段时间才报告时（例如几秒后），也照样写出。在此之前 stdout 上什么都不写。
 - **PUB-2** 同时运行多个 `--share` 实例时，每个实例写出的都是自己的公网地址。本机上另有
   进程在 cloudflared 优先尝试的 metrics 端口（`127.0.0.1:20241`–`20245`）上用同样的方式
   报告别的地址时，也不受影响。
 - **PUB-3** cloudflared 启动后 30 秒内一直读不到可用的主机名时（metrics 端口一直没打开、
   `/quicktunnel` 返回 404、返回的不是预期格式、主机名为空、主机名含有不允许的字符），
-  `serve` 在 cloudflared 启动后 30.0–31.5 秒之间把
-  `serve: could not read the public address; look for it in cloudflared's log` 写到 stderr，
-  不写 PUB-1 的汇总块，也不写出读到的任何内容；之后继续服务，`Ctrl-C` 按 STOP-1 结束。
-- **PUB-4** 等待公网地址期间发生停止事件时，结果与 STOP-1 相同，按 CLEAN-1 的时限结束。
+  `serve` 在 cloudflared 启动后 30.0–31.5 秒之间写出 OUT-1 的块，其中 `Public:` 行是
+  `  Public:  unknown, look for it in cloudflared's log`，不写出读到的任何内容；之后继续
+  服务，`Ctrl-C` 按 STOP-1 结束。
+- **PUB-4** 等待公网地址期间发生停止事件时，结果与 STOP-1 相同，按 CLEAN-1 的时限结束，
+  stdout 上什么都不写。
 - **MULTI-1** 可以同时运行多个实例，端口互不相同；停掉其中一个，其余实例照常服务。
 
 ### 读端口
@@ -146,15 +146,17 @@
 ### 输出管道
 
 - **PIPE-1** stdout 接到一个在 `serve` 写出 OUT-1 的块后就退出的读端时（如 `| head -2`），
-  不带 `--share` 的 `serve` 继续运行和服务，之后 `Ctrl-C` 按 STOP-1 结束。带 `--share` 时，
-  `serve` 写 PUB-1 的汇总块时才发现读端已退出，于是收尾并结束：从 cloudflared 报告出公网地址
-  算起 2 秒内结束，退出码 0，stderr 上有 `write error: broken pipe`。
-- **PIPE-2** stdout 的读端在 `serve` 写入之前就已退出时（如 `| true`），`serve` 在启动后
-  2.5 秒内收尾并结束，退出码 0，stderr 上有 `write error: broken pipe`。
-- **PIPE-3** stdout 和 stderr 的读端都已退出时（如 `|& true`），`serve` 在启动后 2.5 秒内结束，
-  退出码为 0 或 1（取决于 `serve` 和服务谁先写）。
-- **PIPE-4** 只有服务的输出接到已退出的读端、而服务先写入时，`serve` 在启动后 3.5 秒内结束，
-  退出码 1。
+  `serve` 继续运行和服务，之后 `Ctrl-C` 按 STOP-1 结束。
+- **PIPE-2** stdout 的读端在 `serve` 写入之前就已退出时（如 `| true`），`serve` 收尾并结束，
+  退出码 0，stderr 上有 `write error: broken pipe`。不带 `--share` 时在启动后 2.5 秒内结束；
+  带 `--share` 时，在 cloudflared 报告出公网地址后 2 秒内结束。
+- **PIPE-3** stdout 和 stderr 的读端都已退出时（如 `|& true`），`serve` 结束，退出码为 0 或 1
+  （取决于 `serve` 和服务谁先写）。不带 `--share` 时在启动后 2.5 秒内结束；带 `--share` 时，
+  `serve` 在拿到地址之前什么都不写，Caddy 又不理会写入失败，先撞上的是 cloudflared，
+  这时在 cloudflared 第一次写日志后 1.5 秒内结束。
+- **PIPE-4** `--share` 时，只有服务的输出接到已退出的读端、而 cloudflared 先写入时（它因
+  此被 `SIGPIPE` 结束），`serve` 在启动后 3.5 秒内结束，退出码 1。（Caddy 写入失败时不会
+  退出，所以不在此列。）
 
 ### 收尾时限
 
@@ -194,7 +196,8 @@
   退出码 130。
 - **LIM-3** 收尾过程中 `serve` 被 `SIGKILL` 时，按 PROC-2 处理，退出码 137。
 - **LIM-4** `--share` 时，读公网地址用的 `lsof` 卡住（测试里 30 秒不返回），`serve` 照常
-  服务，不写 PUB-1 的汇总块；按 `Ctrl-C` 后按 STOP-1 正常收尾，退出码 0。
+  服务，但 stdout 上什么都不写（连局域网地址也看不到）；按 `Ctrl-C` 后按 STOP-1 正常收尾，
+  退出码 0。
 
 ## 5. 判定方法
 
@@ -216,9 +219,9 @@
   服务都还在（PROC-3）。
 - **计时**：`serve` 的结束时刻由启动它的 shell 在同一行命令里报告，不依赖夹具的轮询。
   没有 shell 能报告时（终端已关闭、父 shell 已死），才用轮询的结果。
-- **公网地址的计时**：cloudflared 的启动时刻取内核记录的进程创建时间；地址的就绪时刻
-  由 cloudflared 替身在打开 metrics 端口之前记下。两者都不会比实际晚，所以测出的时长
-  不会偏短。
+- **cloudflared 相关的计时**：cloudflared 的启动时刻取内核记录的进程创建时间；它第一次
+  写日志的时刻和地址的就绪时刻，由 cloudflared 替身在写日志、打开 metrics 端口之前记下。
+  这些时刻都不会比实际晚，所以测出的时长不会偏短。
 - **退出码**：同样由 shell 报告；前台作业被 `SIGINT` 杀掉时，shell 会放弃同一行剩下的
   命令，这时改为另起一行查询。
 - **时限的宽容**：所有时间上界统一放宽 0.5 秒，与并行数无关；下界不放宽。实测 6 路并行
@@ -289,9 +292,14 @@ cloudflared 日志里的地址。
 7. **疑似残留的提示**：`serve` 启动前只提示、不处理（WARN-1、WARN-2），由用户判断和清理。
 8. **公网地址**（2026-09-29）：`--share` 时 `serve` 把公网地址写进自己的输出（PUB-1 到
    PUB-4）。地址向本实例的 cloudflared 询问（它 metrics 端口上的 `/quicktunnel`），不解析
-   日志；读不到时只提示、照常服务。`--share` 的 `serve` 在启动后还会再写一次 stdout，
-   所以提前退出的读端会在那时被发现（PIPE-1）。读地址用的 `lsof` 卡住时的情况作为已知
-   限制（LIM-4），和 LIM-1 同理。
+   日志；读不到时只提示、照常服务。读地址用的 `lsof` 卡住时的情况作为已知限制（LIM-4），
+   和 LIM-1 同理。
+9. **输出的样式**（2026-09-29）：Caddy 和 cloudflared 的日志照旧输出到终端。`serve` 自己的
+   信息只写一个块，`--share` 时等拿到公网地址（或确定拿不到）再写，所以不会重复；代价是
+   `--share` 时局域网地址也要等这几秒。颜色从简：边框和标签退到暗色，目录粗体，地址带
+   下划线，只有 `Public:` 用黄色提醒它对整个互联网公开；不再用红色粗体。等待地址期间
+   不另写"正在建立隧道"之类的提示：cloudflared 自己的日志已经说明了，而且 `serve` 抢先
+   往 stderr 写东西，会让 PIPE-4（服务先写入）在 `--share` 下无法出现。
 
 ## 10. 时间界限的来历
 
@@ -308,15 +316,19 @@ cloudflared 日志里的地址。
 | CLEAN-1（含 STOP-3 的嵌套 shell） | ≤ 1 秒 | 主循环每 0.5 秒检查一次，服务收到 `TERM` 后约 0.2 秒内退出 | 0.69 / 0.70 |
 | CLEAN-2 | ≤ 2 秒 | 0.5 秒 + 约第 0.9 秒的第二轮补发信号 + 约 0.2 秒 | 2.98 / 1.68 |
 | CLEAN-3、CLEAN-4 | 5.0–6.5 秒 | 50 轮、每轮至少 0.1 秒，加上察觉停止最多 0.5 秒 | 5.57–6.05 / 5.66–5.92 |
-| PIPE-2、PIPE-3 | ≤ 2.5 秒 | Caddy 启动加打印 | 1.54 / 1.45 |
+| PIPE-2（局域网）、PIPE-3 | ≤ 2.5 秒 | Caddy 启动加打印 | 1.54 / 1.45 |
 | PIPE-4 | ≤ 3.5 秒 | 另加替身 1 秒后才写的那条日志 | 2.20 / 2.38 |
 | PUB-1 | ≤ 1 秒 | 主循环每 0.5 秒检查一次，加一轮 `lsof`（几百毫秒）和一次本机 `curl`（几毫秒） | — / 0.76 |
 | PUB-3 | 30.0–31.5 秒 | 截止时间从 cloudflared 启动时算起，所以不会早于 30 秒；之后最多再跑一轮（0.5 秒，加上 `lsof` 和最多 1 秒的 `curl`） | — / 30.11–30.48 |
-| PIPE-1（`--share`） | ≤ 2 秒 | PUB-1 的 1 秒，加上收尾（CLEAN-1）的 1 秒 | — / 1.39 |
+| PIPE-2（`--share`） | ≤ 2 秒 | 从地址就绪算起：PUB-1 的 1 秒，加上收尾（CLEAN-1）的 1 秒 | — / 1.38 |
+| PIPE-3（`--share`） | ≤ 1.5 秒 | 从 cloudflared 第一次写日志算起：主循环最多 0.5 秒后发现它已退出，加上收尾（CLEAN-1）的 1 秒。不从 `serve` 启动算起，因为替身启动 Python 要约 0.4 秒，真实的 cloudflared 一启动就写日志 | — / 0.60 |
 
-PUB-1、PUB-3 和 `--share` 的 PIPE-1 是后来（同一天）加的，只有一轮全量 6 路并行的数据。
-另外单独运行这几个 case 时，测得 PUB-1 最大 0.79 秒、PUB-3 在 30.02–30.52 秒之间、
-PIPE-1 1.38 秒，都在界限内。
+PUB-1、PUB-3 和 `--share` 的 PIPE-2、PIPE-3 是后来（同一天）加的，只有 6 路并行全量的
+数据。上表 PUB-1、PUB-3 取自第一轮；输出改为只写一个块之后的第二轮里，PUB-1 为 0.72–0.83
+秒，PIPE-2、PIPE-3 如上表。第二轮时机器负载很高（load average 14–18，夹具最长间隔达 4 秒），
+PUB-3 有一个样本（32.38 秒）超出界限，单独重跑时正常；这个样本没有被用来放宽界限。
+单独运行时还测得 PUB-1 最大 0.79 秒、PUB-3 在 30.02–30.52 秒之间、`--share` 的 PIPE-2 为
+1.15–1.42 秒、PIPE-3 为 0.17–0.43 秒，都在界限内。
 | PROC-1、PROC-2 | 1 秒 | 停止后，组里剩下的进程收到 `TERM`/`KILL` 立即结束，没有要等的东西 | 2.43 / 0.24 |
 
 超出界限的只有串行那一轮里的 6 个孤立样本：CLEAN-2 一个（2.98 秒）、PORT-1 一个
