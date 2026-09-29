@@ -25,6 +25,21 @@ python3 test/run.py --serve 某个脚本   # 测别的脚本，比如故意改�
 - **[`fixture.py`](fixture.py)：观察 `serve` 实际做了什么。**
 - **[`run.py`](run.py)：执行 case、比对结果、汇总报告。**
 
+## README 与 `spec.py` 必须同步
+
+测试和 README 里的承诺是绑定的：README 是规格，`spec.py` 是它可以执行的形式。
+README 里没有 case 覆盖的承诺，等于没被测试；`spec.py` 里找不到 README 依据的
+case，测的是没人承诺过的东西。所以：
+
+- **改 README 的行为描述**（行为规格、退出码、停止事件、已知限制等）时，在同一次改动
+  里同步改对应的 case；反过来也一样。
+- **调整 README 的章节结构或标题**时，同步更新 `spec.py` 里每个 case 标注的出处
+  （`readme=`），让报告仍然指向正确的段落。
+- **要改变 `serve` 的某项行为**时，README、`spec.py` 和 `serve` 一起改，并且先确定
+  规格该怎么改。
+- **不能只为了让现在的 `serve` 通过测试而修改 README 或 `spec.py`。** 测试测出与
+  README 不符的真实行为，说明测试起作用了，要改的是 `serve`。
+
 ## 怎样判定"没有留下进程"
 
 夹具如果漏看一个进程，就会报告一次"干净"的运行，而那次运行其实并不干净。所以判定

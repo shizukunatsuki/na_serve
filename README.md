@@ -228,6 +228,9 @@ stderr 上还有另外两类输出：
 python3 test/run.py
 ```
 
+测试和本 README 的承诺是绑定的：修改上面的行为描述时，要同步修改
+[`test/spec.py`](test/spec.py) 里对应的 case，反之亦然。
+
 测试会故意让一些进程崩溃，macOS 因此会在 `~/Library/Logs/DiagnosticReports` 里留下
 崩溃报告，有的在运行结束后二三十分钟才写出来，测试脚本不会自动清理。macOS 看起来会
 自动清掉旧报告，但仍建议**跑完后按 [`test/README.md`](test/README.md#副作用崩溃报告)
