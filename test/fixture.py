@@ -53,6 +53,7 @@ REAL_CADDY = shutil.which('caddy')
 REAL_CLOUDFLARED = shutil.which('cloudflared')
 REAL_LSOF = '/usr/sbin/lsof'
 REAL_SCUTIL = '/usr/sbin/scutil'
+REAL_PS = '/bin/ps'
 
 HOST = subprocess.run([REAL_SCUTIL, '--get', 'LocalHostName'],
                       capture_output=True, text=True).stdout.strip()
@@ -316,11 +317,12 @@ time.sleep(LIFETIME)
 
 def write_shims(directory, ledger, caddy='real', lsof='real', scutil='real',
                 cloudflared='idle', missing=(), lifetime=STUB_LIFETIME):
-    """One shim per helper in `directory`. `cloudflared` is a stub mode
+    """One shim per helper (ps included) in `directory`. `cloudflared` is a stub mode
     ('idle', 'draining', 'stubborn') or 'real'; names in `missing` get no
     shim, so serve cannot find them."""
     os.makedirs(directory, exist_ok=True)
-    actions = {'caddy': CADDY[caddy](), 'lsof': LSOF[lsof](), 'scutil': SCUTIL[scutil]()}
+    actions = {'caddy': CADDY[caddy](), 'lsof': LSOF[lsof](), 'scutil': SCUTIL[scutil](),
+               'ps': exec_real(REAL_PS)}
     if cloudflared == 'real':
         actions['cloudflared'] = exec_real(REAL_CLOUDFLARED)
     else:

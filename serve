@@ -66,7 +66,7 @@ done
 typeset cmd
 typeset -a needed=(caddy)
 (( share )) && needed+=(cloudflared)
-needed+=(scutil lsof)
+needed+=(scutil lsof ps)
 for cmd in $needed; do
   if (( ! $+commands[$cmd] )); then
     print -u2 "serve: $cmd not found"
@@ -105,6 +105,38 @@ fi
 # returns (SEGV, BUS, ILL, FPE, TRAP) are left alone, since trapping a real
 # one would only loop; like SIGKILL, they are beyond what a script can catch.
 trap 'stop=1' $stop_signals
+
+# Services an earlier serve left behind when it was killed outright (see the
+# README's known limitations) keep running, the directory still exposed, and
+# nothing else would ever mention them. They look like what serve starts, with
+# a parent that is gone (launchd has adopted them), and are pointed out here
+# before anything starts, never touched: telling them apart from someone
+# else's processes is a guess, and killing on a guess is not serve's call.
+# Another serve that is still running is no match, its services' parent being
+# that serve.
+typeset -a strays pgids
+typeset -a f
+typeset cmdline
+for line in ${(f)"$(ps -A -ww -o pid=,ppid=,pgid=,command= 2>/dev/null)"}; do
+  f=(${=line})
+  (( $#f >= 4 && f[2] == 1 )) || continue
+  cmdline=${f[4,-1]}
+  [[ $cmdline == (*/|)'caddy file-server --browse --listen :0' ||
+     $cmdline == (*/|)'cloudflared tunnel --url http://localhost:'<-> ]] || continue
+  strays+=("    PID $f[1]  PGID $f[3]  $cmdline")
+  (( ${pgids[(Ie)$f[3]]} )) || pgids+=($f[3])
+done
+if (( $#strays )); then
+  typeset warn= off=
+  [[ -t 2 ]] && { warn=$'\e[1;33m'; off=$'\e[0m' }
+  print -ru2 -- "
+${warn}━━━━━━━━━━━━━━━ serve: warning ━━━━━━━━━━━━━━━━${off}
+  These look like services left behind by an earlier serve
+  (their parent is gone), and may still expose a directory:
+${(F)strays}
+  If they are, end them with: ${(j:, :)${(@)pgids/#/kill -KILL -}}
+${warn}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${off}"
+fi
 
 {
   # Port 0 makes the kernel hand out a free ephemeral port. A fixed port would
@@ -155,20 +187,25 @@ trap 'stop=1' $stop_signals
     rc=1
   else
     # Anyone on the LAN (and with --share, anyone at all) can read this, with
-    # nothing hidden (dotfiles included), so make the exposed directory hard to
-    # miss: bold red, spelled out as escape codes because a non-interactive zsh
-    # has no terminal capabilities for %B. Only on a terminal, though; in a
-    # file or a pipe the codes would just be noise.
-    if [[ -t 1 ]]; then
-      print -r -- $'\e[1;31m'"Serving: ${PWD}"$'\e[0m'
-    else
-      print -r -- "Serving: ${PWD}"
-    fi
+    # nothing hidden (dotfiles included), so make it hard to miss among the
+    # services' logs: a framed block, the exposed directory in bold red,
+    # spelled out as escape codes because a non-interactive zsh has no
+    # terminal capabilities for %B. Only on a terminal, though; in a file or
+    # a pipe the codes would just be noise. It goes out in a single write, so
+    # no log line can land inside it, after a newline of its own, so it never
+    # continues a log line that is still being written.
+    typeset bold= red= off= url
+    [[ -t 1 ]] && { bold=$'\e[1m'; red=$'\e[1;31m'; off=$'\e[0m' }
     if [[ -n $host ]]; then
-      print "Local: http://${host}.local:${port}/"
+      url="http://${host}.local:${port}/"
     else
-      print "Local: http://localhost:${port}/ (LocalHostName is not set, so there is no .local name)"
+      url="http://localhost:${port}/ (LocalHostName is not set, so there is no .local name)"
     fi
+    print -r -- "
+${bold}━━━━━━━━━━━━━━━━━━━━ serve ━━━━━━━━━━━━━━━━━━━━${off}
+  ${red}Serving: ${PWD}${off}
+  ${bold}Local:${off}   ${url}
+${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${off}"
     if (( share )); then
       cloudflared tunnel --url "http://localhost:${port}" </dev/null &
       cf_pid=$!

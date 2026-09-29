@@ -146,7 +146,7 @@ def argument_cases():
 
 def dependency_cases():
     for mode in MODES:
-        needed = ('caddy', 'cloudflared', 'scutil', 'lsof') if mode == 'share' else ('caddy', 'scutil', 'lsof')
+        needed = ('caddy', 'cloudflared', 'scutil', 'lsof', 'ps') if mode == 'share' else ('caddy', 'scutil', 'lsof', 'ps')
         for cmd in needed:
             yield Case(f'startup/{mode}/missing {cmd}', 'DEP-1', mode=mode, shims={'missing': (cmd,)},
                        phase='none', ends='itself', exit=1, window=QUICK, messages=(f'serve: {cmd} not found',),
@@ -312,6 +312,12 @@ def limitation_cases():
 
 # ------------------------------------------------------------ usage and output
 
+def warning_cases():
+    for mode in MODES:
+        yield Case(f'warn/{mode}/leftovers are pointed out, nothing else is', ('WARN-1', 'WARN-2'),
+                   kind='warn', mode=mode)
+
+
 def usage_cases():
     for mode in MODES:
         yield Case(f'usage/{mode}/three instances at once', 'MULTI-1', kind='concurrency', mode=mode)
@@ -335,7 +341,7 @@ def all_cases(real_tunnel=False):
     out = []
     for gen in (argument_cases, dependency_cases, hostname_cases, leader_cases, port_cases, pretrap_cases,
                 running_cases, other_signal_cases, ctrl_z_cases, pipe_cases, cleanup_cases,
-                limitation_cases, usage_cases):
+                limitation_cases, warning_cases, usage_cases):
         out.extend(gen())
     ids = [c.id for c in out]
     assert len(ids) == len(set(ids)), 'duplicate case ids'

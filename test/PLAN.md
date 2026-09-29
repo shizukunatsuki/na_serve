@@ -25,7 +25,8 @@
 | 术语 | 含义 |
 | --- | --- |
 | 服务 | Caddy 和（`--share` 时的）cloudflared |
-| 辅助命令 | `serve` 运行的 `scutil` 和 `lsof` |
+| 辅助命令 | `serve` 运行的 `scutil`、`lsof` 和 `ps` |
+| 疑似残留 | 命令行和 `serve` 启动服务时的一样（`caddy file-server --browse --listen :0`，或 `cloudflared tunnel --url http://localhost:<端口>`，前面可以带路径），并且父进程是 launchd（PID 1）的进程 |
 | 后代 | `serve` 直接或间接启动的所有进程：服务、辅助命令，以及它们再启动的进程 |
 | 管道同伴 | shell 和 `serve` 放在同一个作业里的其他命令，如 `serve \|& tee log` 里的 `tee`。它们和 `serve` 同一个进程组，但不是它的后代 |
 | 启动完成 | `serve` 打印出 `Local:` 行的时刻 |
@@ -48,7 +49,7 @@
 
 ### 启动前检查
 
-- **DEP-1** 依次检查 `caddy`、`cloudflared`（仅 `--share`）、`scutil`、`lsof` 是否存在。缺哪个，
+- **DEP-1** 依次检查 `caddy`、`cloudflared`（仅 `--share`）、`scutil`、`lsof`、`ps` 是否存在。缺哪个，
   就把 `serve: <命令> not found` 写到 stderr，退出码 1，在 0.5 秒内结束，不运行任何辅助命令。
 - **LEAD-1** `serve` 不是进程组组长时（例如 `true | serve`，或在没开 job control 的脚本里被
   当作普通命令调用），打印 `serve: not a process group leader, refusing to start`，退出码 1，
@@ -58,10 +59,11 @@
 
 ### 输出与服务
 
-- **OUT-1** stdout 上恰好有两行：`Serving: <当前目录的绝对路径>` 和 `Local: <地址>`。服务和
-  cloudflared 的日志只出现在 stderr 上。
+- **OUT-1** stdout 上恰好是一个空行，加上一个四行的块：含有 `serve` 字样的上边框、
+  `  Serving: <当前目录的绝对路径>`、`  Local:   <地址>`、下边框。服务和 cloudflared 的
+  日志只出现在 stderr 上。
 - **OUT-2** stdout 是终端时，`Serving:` 行是红色粗体（`ESC[1;31m`）；不是终端时，不带任何
-  颜色控制序列。
+  控制序列。
 - **OUT-3** `Local:` 的地址是 `http://<LocalHostName>.local:<端口>/`。读不到 LocalHostName 时
   改为 `http://localhost:<端口>/`，并在同一行注明 `LocalHostName is not set`。
 - **OUT-4** `--share` 时，cloudflared 日志里的隧道地址原样出现在 stderr 上。
@@ -72,6 +74,11 @@
 - **NET-3** 访问目录时返回文件列表，列表中包含点文件。
 - **TUN-1** `--share` 时，恰好启动一个 cloudflared，它转发的目标地址（`--url`）指向本实例
   的端口，并且从这个地址能取到当前目录的正确内容。
+- **WARN-1** 启动服务之前，只要存在疑似残留，就在 stderr 上打印一个警告块，列出每个
+  疑似残留的 PID、进程组和命令行，以及每个进程组的清理命令 `kill -KILL -<进程组>`。
+  `serve` 不结束、不向它们发送任何信号，照常启动。
+- **WARN-2** 不属于疑似残留的进程不出现在警告里：父进程还在的进程（例如另一个正在运行
+  的 `serve` 实例的服务）、命令行不同的进程（例如参数不同的 `caddy`）。
 - **TUN-2** 使用真实 cloudflared 时，隧道地址能在 90 秒内访问到当前目录的正确内容。
 - **MULTI-1** 可以同时运行多个实例，端口互不相同；停掉其中一个，其余实例照常服务。
 
@@ -207,6 +214,11 @@
 | 事件 | 第 2 节的全部停止事件；发给进程组的 `TERM` `INT` `HUP` `QUIT`；父 shell 被杀（会话首进程 / 嵌套 shell）；服务被 `SIGKILL`；`Ctrl-Z` 及其后续；PAUSE-2、PAUSE-3 的全部信号；全部致命信号 |
 | 服务表现 | 空闲、传输中；`--share` 时另加顽固 |
 
+WARN-1、WARN-2 另有专门的 case：夹具自己造出几个"父进程已不在"的假进程，命令行分别和
+疑似残留一致或不一致，再加上一个正在运行的 `serve` 实例，检查警告列出了该列出的、没有
+列出不该列出的，并且那些假进程都没有被动过。检查只针对夹具自己造的这些进程，所以机器
+上本来就有的残留不会让它误判。
+
 每个 case 除了检查它引用的条目，还自动检查 PROC-1（或 PROC-2）和 PROC-3；运行中阶段的
 case 还会在事件发生前检查 OUT-2、OUT-3、NET-1 到 NET-3，以及 `--share` 时的 TUN-1。
 
@@ -238,8 +250,10 @@ case 还会在事件发生前检查 OUT-2、OUT-3、NET-1 到 NET-3，以及 `--
    TUN-1 改为检验转发目标能取到正确内容。
 3. **整机卡顿时的计时失败**：维持一律判失败，但在报告里提醒失败可能来自卡顿（第 5 节）。
 4. **`serve` 本身被强制杀死**（`SIGKILL`、`SEGV` 等）：维持为已知限制，按 PROC-2 检验。
-5. **`Serving:` 行在终端上和服务日志交错**：维持现状，作为已知限制，本计划不作要求。
-   OUT-1 只对 stdout 本身的内容提要求。
+5. **`Serving:` 行在终端上和服务日志交错**：本计划不作要求，OUT-1 只对 stdout 本身的内容
+   提要求。后来 `serve` 改为一次写出带边框、前置空行的块，这个问题在实际使用中已基本
+   避免，README 不再把它列为已知限制。
+7. **疑似残留的提示**：`serve` 启动前只提示、不处理（WARN-1、WARN-2），由用户判断和清理。
 6. **`lsof` 卡住时 10 秒上限不起作用**：维持现状，作为已知限制，按 LIM-1 检验。
 
 ## 10. 时间界限的来历

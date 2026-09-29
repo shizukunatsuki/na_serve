@@ -99,6 +99,7 @@ class World:
         self.term = None
         self.serve = None           # (pid, lstart) once known
         self.peers = {}             # serve's pipeline peers: PID -> start time
+        self.fake_sids = []         # sessions of processes the fixture fakes
 
     # -- setup / teardown
 
@@ -127,6 +128,12 @@ class World:
                 pass
         for t in list(getattr(self, 'terms', [])) or ([self.term] if self.term else []):
             t.destroy()
+        for sid in self.fake_sids:
+            for pid in fx.session_members(sid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
         shutil.rmtree(self.dir, ignore_errors=True)
 
     # -- checks
@@ -272,7 +279,7 @@ class World:
         TUN-1): outside behaviour only, not how serve achieves it. Returns the port."""
         text = t.text(self.mark)
         raw = t.raw[self.mark:]
-        m = re.search(r'Local: (http://(\S+?):(\d+)/)(.*)', text)
+        m = re.search(r'Local:\s+(http://(\S+?):(\d+)/)(.*)', text)
         if not self.check(bool(m), 'Local: line printed'):
             return None
         url, host_seen, port, rest = m.group(1), m.group(2), int(m.group(3)), m.group(4)
@@ -364,7 +371,7 @@ def run_lifecycle(w):
         fx.wait_until(lambda: w.ledger.first('caddy'), 5)
         w.serve_identity()
     elif c.phase in ('running', 'cleanup'):
-        if not t.expect(r'Local: http://', 15, w.mark):
+        if not t.expect(r'Local:\s+http://', 15, w.mark):
             raise Failed('serve never finished starting')
         if c.mode == 'share':
             fx.wait_until(lambda: w.ledger.first('cloudflared'), 5)
@@ -450,7 +457,7 @@ def run_lifecycle(w):
             t.run('fg')
         if then in ('resume', 'fg', 'ctrl-c') and c.phase in ('pretrap', 'startup', 'running') \
                 and e.get('printed') is not False:
-            m = t.expect(r'Local: http://(\S+?):\d+/', 15, w.mark)
+            m = t.expect(r'Local:\s+http://(\S+?):\d+/', 15, w.mark)
             if not m:
                 w.check(False, 'serve finishes starting / keeps running')
             elif e.get('host'):
@@ -517,7 +524,7 @@ def group_members(w):
 
 
 def local_port(t, w):
-    m = re.search(r'Local: http://\S+?:(\d+)/', t.text(w.mark))
+    m = re.search(r'Local:\s+http://\S+?:(\d+)/', t.text(w.mark))
     return int(m.group(1)) if m else None
 
 
@@ -591,7 +598,7 @@ def run_concurrency(w):
         t.mark0 = t.mark()
         t.run(f'PATH={fx.q(w.shims)} {fx.q(fx.SERVE)} {w.case.args}')
     for t in w.terms:
-        m = t.expect(r'Local: http://\S+?:(\d+)/', 15, t.mark0)
+        m = t.expect(r'Local:\s+http://\S+?:(\d+)/', 15, t.mark0)
         ports.append(int(m.group(1)) if m else None)
     w.check(None not in ports and len(set(ports)) == 3 or str(ports), 'three instances, three ports')
     stopped = w.terms[1]
@@ -614,21 +621,26 @@ def run_concurrency(w):
 def run_streams(w):
     t = w.term = w.open_terminal()
     w.launch(t, pipe=' 2>/dev/null')
-    ok = t.expect(r'Local: http://', 15, w.mark)
+    ok = t.expect(r'Local:\s+http://', 15, w.mark)
     w.check(bool(ok), 'Serving:/Local: on stdout')
     fx.sleep(1.5)
     quiet = t.text(w.mark)
-    # past the echo of the command line itself, stdout holds exactly two lines
-    lines = [l for l in quiet.splitlines()[1:] if l.strip()]
-    w.check(len(lines) == 2 and lines[0] == f'Serving: {w.site}' and re.match(r'Local: http://\S+/$', lines[1])
-            is not None or lines, 'stdout holds exactly the Serving: and Local: lines')
+    # past the echo of the command line itself, stdout holds exactly an empty
+    # line and the four-line block
+    lines = quiet.splitlines()[1:]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    ok = (len(lines) == 5 and lines[0] == '' and ' serve ' in lines[1] and set(lines[1]) <= set(' serve━')
+          and lines[2] == f'  Serving: {w.site}' and re.match(r'  Local:   http://\S+/$', lines[3]) is not None
+          and set(lines[4]) == {'━'})
+    w.check(ok or lines, 'stdout holds exactly the empty line and the serve block')
     t.send(KEYS['^C'])
     w.wait_serve_gone(5)
     w.serve = None
     w.ledger = fx.Ledger(w.ledger.path, w.sids)
     fx.sleep(0.5)
     w.launch(t)
-    t.expect(r'Local: http://', 15, w.mark)
+    t.expect(r'Local:\s+http://', 15, w.mark)
     fx.sleep(1.5)
     loud = t.text(w.mark)
     w.check('server running' in loud, 'caddy\'s log on the terminal')
@@ -639,8 +651,67 @@ def run_streams(w):
     w.check(w.wait_clean(STOP_AND_LEFTOVER_WAIT) or w.describe(w.leftovers()), 'nothing left behind')
 
 
+def fake_orphan(w, name, args, orphan=True):
+    """A process whose command line reads `<path>/name args`, in a session of
+    its own. With `orphan`, the shell that started it exits at once, so launchd
+    adopts it (parent PID 1); without, the shell stays and waits for it.
+    Returns (pid, pgid). It runs a finite STALL seconds either way."""
+    d = os.path.join(w.dir, 'fake')
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, name)
+    if not os.path.exists(path):
+        with open(path, 'w') as f:
+            f.write(f'#!/bin/sh\n/bin/sleep {fx.STALL}\n')
+        os.chmod(path, 0o755)
+    line = f'{fx.q(path)} {args} & echo $!' + ('' if orphan else '; wait')
+    p = subprocess.Popen(['/bin/sh', '-c', line], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    fx.register_session(p.pid)
+    w.fake_sids.append(p.pid)
+    pid = int(p.stdout.readline())
+    if orphan:
+        p.wait()
+        fx.wait_until(lambda: (fx.proc_table().get(pid) or fx.Proc(0, 0, 0, '', '', '')).ppid == 1, 3)
+    return pid, p.pid
+
+
+def run_warn(w):
+    """WARN-1, WARN-2: with fakes the fixture made (and a serve that is still
+    running), what the warning lists and what it leaves alone."""
+    listed_ok = [fake_orphan(w, 'caddy', 'file-server --browse --listen :0'),
+                 fake_orphan(w, 'cloudflared', 'tunnel --url http://localhost:12345')]
+    unlisted = [fake_orphan(w, 'caddy', 'file-server --listen :0'),
+                fake_orphan(w, 'caddy', 'file-server --browse --listen :0', orphan=False)]
+    w.terms = [w.open_terminal(), w.open_terminal()]
+    other, t = w.terms
+    other.mark0 = other.mark()
+    other.run(f'PATH={fx.q(w.shims)} {fx.q(fx.SERVE)} {w.case.args}')
+    w.check(bool(other.expect(r'Local:\s+http://', 15, other.mark0)), 'the other serve starts')
+    theirs = [e.pid for e in w.ledger.entries() if e.name in ('caddy', 'cloudflared')]
+    w.term = t
+    w.launch(t)
+    w.check(bool(t.expect(r'Local:\s+http://', 15, w.mark)), 'serve starts, warning or not')
+    text = t.text(w.mark)
+    block = re.search(r'serve: warning.*?\n(.*?)\n[^\n]*━{10,}', text, re.S)
+    w.check(bool(block), 'a warning block is printed')
+    body = block.group(1) if block else ''
+    shown = {int(pid): int(pgid) for pid, pgid in re.findall(r'PID (\d+)\s+PGID (\d+)', body)}
+    for pid, pgid in listed_ok:
+        w.check(shown.get(pid) == pgid or f'PID {pid} PGID {pgid} not in: {body[:300]}', 'a leftover is listed with its group')
+        w.check(f'kill -KILL -{pgid}' in body, f'the remedy for group {pgid} is given')
+    for pid, _ in unlisted:
+        w.check(pid not in shown, f'PID {pid} (not a leftover) is not listed')
+    for pid in theirs:
+        w.check(pid not in shown, f'the running serve\'s service {pid} is not listed')
+    for tt in w.terms:
+        tt.send(KEYS['^C'])
+    w.check(w.wait_clean(STOP_AND_LEFTOVER_WAIT) or w.describe(w.leftovers()), 'nothing left behind')
+    table = fx.proc_table()
+    w.check(all(pid in table for pid, _ in listed_ok + unlisted), 'serve touched none of them')
+
+
 RUNNERS = {'lifecycle': run_lifecycle, 'args': run_args, 'leader': run_leader,
-           'concurrency': run_concurrency, 'streams': run_streams}
+           'concurrency': run_concurrency, 'streams': run_streams, 'warn': run_warn}
 
 
 def run_case(case, root, big):
@@ -690,7 +761,7 @@ class Bystander:
         self.t = self.w.open_terminal()
         self.w.term = self.t
         self.w.launch(self.t)
-        if not self.t.expect(r'Local: http://\S+?:(\d+)/', 15, self.w.mark):
+        if not self.t.expect(r'Local:\s+http://\S+?:(\d+)/', 15, self.w.mark):
             raise SystemExit('bystander serve did not start')
         fx.wait_until(lambda: self.w.ledger.first('cloudflared'), 5)
         self.w.serve_identity()
