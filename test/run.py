@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Run every case in spec.py against the real serve and report.
 
+The test plan (PLAN.md) is what the cases check; before anything runs, every
+plan item must be cited by at least one case and every cited item must exist
+in the plan, or the run stops there.
+
 Each case gets a fresh terminal session, its own site directory, its own
 ledger and shims, and a decoy: a process started from the same shell, in
 the same session but outside serve's process group, that ignores SIGHUP.
@@ -37,6 +41,18 @@ import fixture as fx          # noqa: E402
 import spec                   # noqa: E402
 
 KEYS = {'^C': b'\x03', '^\\': b'\x1c', '^Z': b'\x1a'}
+PLAN = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'PLAN.md')
+
+
+def plan_coverage():
+    """Problems between PLAN.md and spec.py: plan items no case cites, and
+    cited items the plan does not have. Items are the `- **ID**` entries."""
+    with open(PLAN) as f:
+        items = set(re.findall(r'^- \*\*([A-Z]+-\d+)\b', f.read(), re.M))
+    cited = {i for c in spec.all_cases() + spec.all_cases(real_tunnel=True) for i in c.plan}
+    problems = [f'plan item {i} is not checked by any case' for i in sorted(items - cited)]
+    problems += [f'cases cite {i}, which is not in the plan' for i in sorted(cited - items)]
+    return problems
 MARGIN = 1.0                  # added to upper time bounds; raised with -j
 
 
@@ -232,8 +248,8 @@ class World:
         self.check(host_seen == want_host or f'{host_seen} (want {want_host})', 'Local: host')
         if want_host == 'localhost':
             self.check('LocalHostName is not set' in rest, 'Local: says why there is no .local name')
-        self.check(re.search(r'(?m)^Serving: ' + re.escape(self.site) + r'$', text) is not None,
-                   'Serving: names the directory')
+        self.check(re.search(r'(?m)^Serving: ' + re.escape(self.site) + r'$', text) is not None
+                   or [l for l in text.splitlines() if 'Serving' in l], 'Serving: names the directory')
         self.check((fx.RED + b'Serving: ' in raw) == stdout_tty,
                    'Serving: in bold red exactly when stdout is a terminal')
         sp = self.serve_identity()
@@ -356,17 +372,22 @@ def run_lifecycle(w):
     if ends == 'itself':
         lo, hi = e.get('window', (0, 3))
         t_ref = w.t0 if c.phase == 'none' else t_event
+        gone, dt, source = True, None, None
+        w.timeline = []
         if w.serve or w.serve_identity(timeout=0.5):
             gone = w.wait_serve_gone(hi + MARGIN + 1)
-            dt = time.time() - t_ref
+            dt, source = time.time() - t_ref, 'polled'
             w.check(gone, 'serve ends by itself')
-            report = w.end_report(t, 2.0) if gone and shell_alive else None
-            source = 'polled'
-            if report:                  # the shell's own clock, not the poll's
-                dt, source = report[0] - t_ref, 'reported by the shell'
-            if gone:
-                w.check(lo <= dt <= hi + MARGIN or f'{dt:.2f}s ({source}), want {lo}-{hi}; timeline: '
-                        + ' | '.join(w.timeline), 'serve ends in time')
+        # the shell's own clock, not the poll's; it also times a serve that
+        # ended before any helper ran, whose PID the fixture never learnt
+        report = w.end_report(t, hi + MARGIN + 2) if gone and shell_alive else None
+        if report:
+            dt, source = report[0] - t_ref, 'reported by the shell'
+        if gone and dt is not None:
+            w.check(lo <= dt <= hi + MARGIN or f'{dt:.2f}s ({source}), want {lo}-{hi}; timeline: '
+                    + ' | '.join(w.timeline), 'serve ends in time')
+        elif gone:
+            w.check(False, 'serve\'s end could be timed')
         if shell_alive:
             got = w.query_exit(t, timeout=hi + MARGIN + 5)
             want = e.get('exit')
@@ -554,8 +575,10 @@ def run_streams(w):
     w.check(bool(ok), 'Serving:/Local: on stdout')
     fx.sleep(1.5)
     quiet = t.text(w.mark)
-    w.check('Serving:' in quiet and 'server running' not in quiet and 'INF |' not in quiet,
-            'with stderr silenced, only serve\'s two lines remain')
+    # past the echo of the command line itself, stdout holds exactly two lines
+    lines = [l for l in quiet.splitlines()[1:] if l.strip()]
+    w.check(len(lines) == 2 and lines[0] == f'Serving: {w.site}' and re.match(r'Local: http://\S+/$', lines[1])
+            is not None or lines, 'stdout holds exactly the Serving: and Local: lines')
     t.send(KEYS['^C'])
     w.wait_serve_gone(5)
     w.serve = None
@@ -593,7 +616,7 @@ def run_case(case, root, big):
         except Exception:
             pass
         w.teardown()
-    return {'id': case.id, 'readme': case.readme, 'failures': w.failures,
+    return {'id': case.id, 'plan': case.plan, 'failures': w.failures,
             'seconds': round(time.time() - t0, 1), 'sids': w.sids}
 
 
@@ -615,7 +638,7 @@ class Bystander:
     own: no case may disturb it."""
 
     def __init__(self, root, big):
-        self.case = spec.Case('bystander', 'Process boundary', mode='share')
+        self.case = spec.Case('bystander', 'PROC-3', mode='share')
         self.w = World(self.case, root, big)
         self.t = self.w.open_terminal()
         self.w.term = self.t
@@ -651,10 +674,13 @@ def main():
     if opts.serve:
         os.environ['NA_SERVE_UNDER_TEST'] = fx.SERVE = os.path.abspath(opts.serve)
 
+    problems = plan_coverage()
+    if problems:
+        sys.exit('PLAN.md and spec.py disagree:\n  ' + '\n  '.join(problems))
     cases = [c for c in spec.all_cases(opts.real_tunnel) if not opts.k or any(k in c.id for k in opts.k)]
     if opts.list:
         for c in cases:
-            print(f'{c.id}    [{c.readme}]')
+            print(f'{c.id}    [{" ".join(c.plan)}]')
         print(f'{len(cases)} cases')
         return
     if not fx.REAL_CADDY:
@@ -724,7 +750,7 @@ def main():
         print(f'fixture leftovers swept after the run: {len(stray)} ('
               + ', '.join(c[:40] for c in stray.values()) + ')')
     for r in sorted(failed, key=lambda r: r['id']):
-        print(f'FAIL {r["id"]}  [{r["readme"]}]')
+        print(f'FAIL {r["id"]}  [{" ".join(r["plan"])}]')
         for f in r['failures']:
             print(f'     - {f}')
     sys.exit(0 if not failed and bystander_ok and not stray else 1)

@@ -1,12 +1,12 @@
 # 测试
 
 端到端测试。用真实的 `caddy`，在伪终端里驱动交互式 zsh 运行 `serve`，逐条检验
-[README](../README.md) 里的行为规格。
+[测试计划](PLAN.md)。测试计划是测试的唯一依据，独立于项目的 README 和 `serve` 的实现。
 
 ```bash
 python3 test/run.py                   # 全部 case，cloudflared 用本地替身
 python3 test/run.py -k lsof -k pretrap # 只跑 id 里含这些字样的 case
-python3 test/run.py --list            # 列出全部 case 和它们依据的 README 段落
+python3 test/run.py --list            # 列出全部 case 和它们检验的计划条目
 python3 test/run.py --real-tunnel     # 只跑少数几个需要真实隧道的 case
 python3 test/run.py --serve 某个脚本   # 测别的脚本，比如故意改坏的副本
 ```
@@ -14,31 +14,27 @@ python3 test/run.py --serve 某个脚本   # 测别的脚本，比如故意改�
 前提：macOS，`caddy` 在 PATH 上。只有 `--real-tunnel` 需要 `cloudflared`。默认 6 路并行，
 可以用 `-j` 调整。
 
-## 三个文件
+## 四个文件
 
-- **[`spec.py`](spec.py)：每个 case 应该发生什么。** 预期结果只取自 README，不参照
-  `serve` 的代码或它现在的表现。每个 case 都标明依据的 README 段落。README 里列举的
-  东西（信号、停止事件、依赖命令、参数）整张表拿来，再和它适用的每种组合做笛卡尔积：
+- **[`PLAN.md`](PLAN.md)：测试计划。** 规定 `serve` 必须做到什么（带编号的条目和具体
+  界限，包括"不留孤儿进程"的精确定义）、怎样判定、覆盖哪些情况，以及变更规则。
+- **[`spec.py`](spec.py)：每个 case 应该发生什么。** 每个 case 都引用它检验的计划条目
+  编号。计划里列举的东西（信号、停止事件、依赖命令、参数）整张表拿来，再和它适用的
+  每种组合做笛卡尔积：
   - 运行模式：局域网 / `--share`；
   - 事件发生的阶段：启动前、等端口时、运行中、收尾中；
   - 子进程的表现：没有请求在传 / 有下载在传 / 无视一切信号。
 - **[`fixture.py`](fixture.py)：观察 `serve` 实际做了什么。**
 - **[`run.py`](run.py)：执行 case、比对结果、汇总报告。**
 
-## README 与 `spec.py` 必须同步
+## 计划和 case 保持一致
 
-测试和 README 里的承诺是绑定的：README 是规格，`spec.py` 是它可以执行的形式。
-README 里没有 case 覆盖的承诺，等于没被测试；`spec.py` 里找不到 README 依据的
-case，测的是没人承诺过的东西。所以：
+`run.py` 每次运行前，都会核对 `PLAN.md` 和 `spec.py`：计划里的每个条目都至少有一个
+case 检验；每个 case 引用的条目都在计划里。有一边对不上，运行就直接停止，并列出
+问题。所以计划和 case 不会各改各的。
 
-- **改 README 的行为描述**（行为规格、退出码、停止事件、已知限制等）时，在同一次改动
-  里同步改对应的 case；反过来也一样。
-- **调整 README 的章节结构或标题**时，同步更新 `spec.py` 里每个 case 标注的出处
-  （`readme=`），让报告仍然指向正确的段落。
-- **要改变 `serve` 的某项行为**时，README、`spec.py` 和 `serve` 一起改，并且先确定
-  规格该怎么改。
-- **不能只为了让现在的 `serve` 通过测试而修改 README 或 `spec.py`。** 测试测出与
-  README 不符的真实行为，说明测试起作用了，要改的是 `serve`。
+修改计划、修改夹具时的规则见 [`PLAN.md` 第 8 节](PLAN.md#8-变更规则)。最重要的一条：
+测试测出 `serve` 不符合计划，要改的是 `serve`，不能为了让它通过而改计划或夹具。
 
 ## 怎样判定"没有留下进程"
 
@@ -63,8 +59,8 @@ case，测的是没人承诺过的东西。所以：
   `SIGHUP`，用来证明 `serve` 没有把信号发到自己的进程组以外。
 
 整轮运行期间，还有一个在所有 case 之前启动的旁观 `serve` 实例，每个 case 之后都要
-确认它没受影响。README 说会留下进程的情况（已知限制），要求留下的恰好是 `serve` 原来
-的进程组，并且用 README 给出的办法（`kill -KILL -<PGID>`）能清干净。
+确认它没受影响。计划允许留下进程的情况（PROC-2），要求留下的恰好是 `serve` 原来
+的进程组，并且 `kill -KILL -<PGID>` 能清干净。
 
 ## 夹具自身必须遵守的几条
 
@@ -102,9 +98,9 @@ case，测的是没人承诺过的东西。所以：
 
 ## 副作用：崩溃报告
 
-README 的已知限制里，有几个致命信号是 `serve` 不捕获的：`SEGV`、`BUS`、`ILL`、`FPE`、
-`TRAP`，以及启动前的 `ABRT`、`EMT`、`SYS`。测试会真的把这些信号发给 `serve`，让 zsh
-按默认动作崩溃；启动前按 `Ctrl-\` 的 case 还会让夹具里的 shell 垫片和 `sleep` 跟着
+测试计划要求检验 `serve` 在致命信号 `SEGV`、`BUS`、`ILL`、`FPE`、`TRAP` 下的表现
+（PROC-2），以及启动前收到 `ABRT`、`EMT`、`SYS` 的表现（PRE-1）。测试会真的把这些信号
+发给 `serve`，让 zsh 按默认动作崩溃；启动前按 `Ctrl-\` 的 case 还会让夹具里的 shell 垫片和 `sleep` 跟着
 崩溃。macOS 会为每次崩溃运行 ReportCrash，在 `~/Library/Logs/DiagnosticReports` 里
 生成崩溃报告：`zsh-*.ips`、`bash-*.ips`（`/bin/sh` 实际运行的是 bash）、`sh-*.ips`、
 `sleep-*.ips`。每跑一次全套大约新增几十个。
