@@ -21,12 +21,22 @@ setopt nobgnice
 
 zmodload zsh/system zsh/zselect || exit 1
 
-# Until the services start, a stop signal simply ends serve: there is nothing
-# to clean up yet. The default action does that for most of them, but zsh
-# ignores QUIT and turns HUP into exit 1, so those two get the same end as
-# the rest (128 + the signal number). The cleanup traps below replace these.
-trap 'exit 131' QUIT
-trap 'exit 129' HUP
+# Every signal that stops serve; see the cleanup traps further down for why
+# exactly these.
+typeset -a stop_signals=(INT HUP TERM QUIT PIPE ALRM USR1 USR2 VTALRM PROF XCPU XFSZ
+  ABRT EMT SYS)
+
+# Until the services start, a stop signal ends serve at once, with 128 + the
+# signal number. Left to their default actions they would mostly do that too,
+# but zsh ignores QUIT and turns HUP into exit 1, and serve may be waiting on
+# a helper (scutil) that a signal sent to serve alone never reaches: it would
+# run on after serve. So each gets a trap that first sends TERM to serve's own
+# process group, helper included. Before the leader check below, that group
+# may not exist; the kill then reaches nobody, which is still right, since
+# nothing has been started. The cleanup traps replace these.
+for sig in $stop_signals; do
+  trap "trap '' \$stop_signals; kill -TERM -\$\$ 2>/dev/null; exit $(( ${signals[(ie)$sig]} - 1 + 128 ))" $sig
+done
 
 # The public tunnel is opt-in: exposing a directory to the whole internet
 # should never be what happens by default.
@@ -94,8 +104,6 @@ fi
 # with ENOSYS. Faults that re-run the faulting instruction when the handler
 # returns (SEGV, BUS, ILL, FPE, TRAP) are left alone, since trapping a real
 # one would only loop; like SIGKILL, they are beyond what a script can catch.
-typeset -a stop_signals=(INT HUP TERM QUIT PIPE ALRM USR1 USR2 VTALRM PROF XCPU XFSZ
-  ABRT EMT SYS)
 trap 'stop=1' $stop_signals
 
 {
@@ -127,14 +135,17 @@ trap 'stop=1' $stop_signals
       break
     done
     [[ -n $port ]] && break
+    # A parent gone during startup is a stop like any other, rather than
+    # something noticed only once the services are up
+    (( sysparams[ppid] == parent )) || stop=1
     (( stop )) && break
     kill -0 $caddy_pid 2>/dev/null || break
     zselect -t 10
   done
 
   if (( stop )); then
-    # Interrupted during startup: the same signal also reached caddy directly,
-    # so its state says nothing, and nothing else gets started
+    # Interrupted during startup (or the parent is gone): caddy may have had
+    # the same signal, so its state says nothing, and nothing else gets started
     :
   elif ! kill -0 $caddy_pid 2>/dev/null; then
     print -u2 "serve: caddy failed to start"
