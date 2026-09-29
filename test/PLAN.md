@@ -63,7 +63,7 @@
 
 - **OUT-1** stdout 上先是一个空行，加上一个四行的块：含有 `serve` 字样的上边框、
   `  Serving: <当前目录的绝对路径>`、`  Local:   <地址>`、下边框。不带 `--share` 时，
-  stdout 上只有这些；带 `--share` 时，之后只可能再有 PUB-1 的块。服务和 cloudflared 的
+  stdout 上只有这些；带 `--share` 时，之后只可能再有 PUB-1 的汇总块。服务和 cloudflared 的
   日志只出现在 stderr 上。
 - **OUT-2** stdout 是终端时，`Serving:` 行和 `Public:` 行是红色粗体（`ESC[1;31m`）；不是
   终端时，stdout 上不带任何控制序列。
@@ -88,8 +88,8 @@
 ### 公网地址
 
 - **PUB-1** `--share` 时，cloudflared 报告出公网地址后 1 秒内，`serve` 在 stdout 上写出
-  一个空行，加上一个三行的块：含有 `serve` 字样的上边框、`  Public:  https://<主机名>/`、
-  下边框。地址就是本实例的公网地址；cloudflared 过一段时间才报告时（例如几秒后），也照样
+  一个空行，加上一个五行的汇总块：含有 `serve` 字样的上边框、和 OUT-1 相同的 `Serving:`
+  行与 `Local:` 行、`  Public:  https://<主机名>/`、下边框。地址就是本实例的公网地址；cloudflared 过一段时间才报告时（例如几秒后），也照样
   写出。整个运行期间只写一次。
 - **PUB-2** 同时运行多个 `--share` 实例时，每个实例写出的都是自己的公网地址。本机上另有
   进程在 cloudflared 优先尝试的 metrics 端口（`127.0.0.1:20241`–`20245`）上用同样的方式
@@ -98,7 +98,7 @@
   `/quicktunnel` 返回 404、返回的不是预期格式、主机名为空、主机名含有不允许的字符），
   `serve` 在 cloudflared 启动后 30.0–31.5 秒之间把
   `serve: could not read the public address; look for it in cloudflared's log` 写到 stderr，
-  不写 PUB-1 的块，也不写出读到的任何内容；之后继续服务，`Ctrl-C` 按 STOP-1 结束。
+  不写 PUB-1 的汇总块，也不写出读到的任何内容；之后继续服务，`Ctrl-C` 按 STOP-1 结束。
 - **PUB-4** 等待公网地址期间发生停止事件时，结果与 STOP-1 相同，按 CLEAN-1 的时限结束。
 - **MULTI-1** 可以同时运行多个实例，端口互不相同；停掉其中一个，其余实例照常服务。
 
@@ -147,7 +147,7 @@
 
 - **PIPE-1** stdout 接到一个在 `serve` 写出 OUT-1 的块后就退出的读端时（如 `| head -2`），
   不带 `--share` 的 `serve` 继续运行和服务，之后 `Ctrl-C` 按 STOP-1 结束。带 `--share` 时，
-  `serve` 写 PUB-1 的块时才发现读端已退出，于是收尾并结束：从 cloudflared 报告出公网地址
+  `serve` 写 PUB-1 的汇总块时才发现读端已退出，于是收尾并结束：从 cloudflared 报告出公网地址
   算起 2 秒内结束，退出码 0，stderr 上有 `write error: broken pipe`。
 - **PIPE-2** stdout 的读端在 `serve` 写入之前就已退出时（如 `| true`），`serve` 在启动后
   2.5 秒内收尾并结束，退出码 0，stderr 上有 `write error: broken pipe`。
@@ -194,7 +194,7 @@
   退出码 130。
 - **LIM-3** 收尾过程中 `serve` 被 `SIGKILL` 时，按 PROC-2 处理，退出码 137。
 - **LIM-4** `--share` 时，读公网地址用的 `lsof` 卡住（测试里 30 秒不返回），`serve` 照常
-  服务，不写 PUB-1 的块；按 `Ctrl-C` 后按 STOP-1 正常收尾，退出码 0。
+  服务，不写 PUB-1 的汇总块；按 `Ctrl-C` 后按 STOP-1 正常收尾，退出码 0。
 
 ## 5. 判定方法
 

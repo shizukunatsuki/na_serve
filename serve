@@ -192,8 +192,9 @@ fi
   else
     # Anyone on the LAN (and with --share, anyone at all) can read this, with
     # nothing hidden (dotfiles included), so make it hard to miss among the
-    # services' logs: a framed block (with --share, a second one follows once
-    # the tunnel has its address), the exposed directory in bold red,
+    # services' logs: a framed block (with --share, a second one, with the
+    # public address too, follows once the tunnel has it), the exposed
+    # directory in bold red,
     # spelled out as escape codes because a non-interactive zsh has no
     # terminal capabilities for %B. Only on a terminal, though; in a file or
     # a pipe the codes would just be noise. It goes out in a single write, so
@@ -252,8 +253,12 @@ ${bold}━━━━━━━━━━━━━━━━━━━━━━━━�
           [[ $body == *'"hostname":"'* ]] || continue
           public=${${body#*\"hostname\":\"}%%\"*}
           if [[ -n $public && ${#public} -le 253 && $public != *[^A-Za-z0-9.-]* ]]; then
+            # Everything in one place, since the first block has scrolled
+            # away under the tunnel's logs by now
             print -r -- "
 ${bold}━━━━━━━━━━━━━━━━━━━━ serve ━━━━━━━━━━━━━━━━━━━━${off}
+  ${red}Serving: ${PWD}${off}
+  ${bold}Local:${off}   ${url}
   ${red}Public:  https://${public}/${off}
 ${bold}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${off}"
             public_deadline=0

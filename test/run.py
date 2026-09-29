@@ -649,7 +649,9 @@ def stop_with_ctrl_c(w, t, want_exit):
     w.check(w.timed_clean('clean_after') or w.describe(w.leftovers()), 'nothing left behind')
 
 
-PUBLIC_BLOCK = re.compile(r'\n\n[^\n]*━+ serve ━+[^\n]*\n  Public:  (\S+)\n━+\n')
+# PUB-1's summary: Serving:, Local: and Public: together
+PUBLIC_BLOCK = re.compile(r'\n\n[^\n]*━+ serve ━+[^\n]*\n  Serving: ([^\n]*)\n  Local:   ([^\n]*)\n'
+                          r'  Public:  (\S+)\n━+\n')
 GIVE_UP = "serve: could not read the public address; look for it in cloudflared's log"
 
 
@@ -679,9 +681,14 @@ def run_public(w):
         text = t.text(w.mark)
         block = PUBLIC_BLOCK.search(text)
         logged = re.search(TUNNEL_LOGGED, text)
-        w.check(bool(block) or text[-600:], 'an empty line and the three-line Public: block')
+        w.check(bool(block) or text[-600:], 'an empty line and the five-line summary block')
+        if block:
+            first = re.search(r'Local:   ([^\n]*)\n', text)
+            w.check(block.group(1) == w.site or block.group(1), 'the summary names the directory')
+            w.check(bool(first) and block.group(2) == first.group(1) or block.group(2),
+                    'the summary repeats the Local: address')
         if block and logged:
-            w.check(block.group(1) == f'https://{logged.group(1)}/' or block.group(1),
+            w.check(block.group(3) == f'https://{logged.group(1)}/' or block.group(3),
                     'Public: shows this instance\'s tunnel address')
         w.check(text.count('Public:') == 1 or text.count('Public:'), 'Public: shown once')
     else:
@@ -801,9 +808,11 @@ def run_streams(w):
           and lines[2] == f'  Serving: {w.site}' and re.match(r'  Local:   http://\S+/$', lines[3]) is not None
           and frame(lines[4], False))
     if w.case.mode == 'share':
-        ok = ok and len(lines) == 9 and lines[5] == '' and frame(lines[6], True) and frame(lines[8], False) \
-            and re.fullmatch(r'  Public:  https://[a-z0-9-]+\.trycloudflare\.com/', lines[7]) is not None
-        what = 'stdout holds exactly the serve block and then the Public: block, each after an empty line'
+        ok = ok and len(lines) == 11 and lines[5] == '' and frame(lines[6], True) \
+            and lines[7:9] == lines[2:4] \
+            and re.fullmatch(r'  Public:  https://[a-z0-9-]+\.trycloudflare\.com/', lines[9]) is not None \
+            and frame(lines[10], False)
+        what = 'stdout holds exactly the serve block and then the summary block, each after an empty line'
     else:
         ok = ok and len(lines) == 5
         what = 'stdout holds exactly the empty line and the serve block'

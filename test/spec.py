@@ -279,7 +279,7 @@ def pipe_cases():
             yield Case(f'output/{mode}/| head -2 (reader leaves, nothing more is written)', 'PIPE-1', mode=mode,
                        pipe=' | head -2', phase='none', ends='continues', then='ctrl-c', exit=0, stdout_tty=False)
         else:
-            yield Case(f'output/{mode}/| head -2 (reader leaves, the Public: block finds it gone)', 'PIPE-1',
+            yield Case(f'output/{mode}/| head -2 (reader leaves, the summary block finds it gone)', 'PIPE-1',
                        mode=mode, pipe=' | head -2', phase='none', ends='itself', exit=0, window=PIPE_PUBLIC,
                        since='address', messages=('write error: broken pipe',))
         yield Case(f'output/{mode}/| true (serve writes first)', 'PIPE-2', mode=mode, pipe=' | true',
