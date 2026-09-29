@@ -2,7 +2,7 @@
 and stand-ins for the helpers serve runs.
 
 This module only observes what serve did; what it *should* do is spec.py,
-taken from README.md. Observing has to be airtight, because a fixture that
+taken from the test plan (PLAN.md). Observing has to be airtight, because a fixture that
 misses a process reports a leak-free run that is not one. Two independent
 records make that hold:
 
@@ -13,8 +13,8 @@ records make that hold:
   the decoy left in the session": no process tree to sample, so nothing
   short-lived can slip between two samples.
 
-* serve's PATH holds nothing but ledger shims. caddy, cloudflared, lsof and
-  scutil each write down who they are (PID, parent, arguments) and only then
+* serve's PATH holds nothing but ledger shims. caddy, cloudflared, lsof,
+  scutil, ps and curl each write down who they are (PID, parent, arguments) and only then
   exec the real program under the same PID, so everything serve runs is on
   record before it can do anything. A shim uses nothing but shell builtins:
   serve runs lsof ten times a second while it waits for a port, and a shim
@@ -54,6 +54,7 @@ REAL_CLOUDFLARED = shutil.which('cloudflared')
 REAL_LSOF = '/usr/sbin/lsof'
 REAL_SCUTIL = '/usr/sbin/scutil'
 REAL_PS = '/bin/ps'
+REAL_CURL = '/usr/bin/curl'
 
 HOST = subprocess.run([REAL_SCUTIL, '--get', 'LocalHostName'],
                       capture_output=True, text=True).stdout.strip()
@@ -98,6 +99,24 @@ def commands(pids):
     out = subprocess.run(['/bin/ps', '-ww', '-o', 'pid=,command=', '-p', ','.join(pids)],
                          capture_output=True, text=True).stdout
     return {int(l.split(None, 1)[0]): (l.split(None, 1) + [''])[1] for l in out.splitlines() if l.strip()}
+
+
+def process_start(pid):
+    """When `pid` was created, in seconds since the epoch, to the microsecond,
+    as the kernel recorded it (the fork, so before the process could do
+    anything); None if it is gone. ps only gives whole seconds."""
+    import ctypes
+    import ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+    buf = ctypes.create_string_buffer(1024)   # struct kinfo_proc (648 bytes)
+    size = ctypes.c_size_t(len(buf))
+    mib = (ctypes.c_int * 4)(1, 14, 1, pid)  # CTL_KERN, KERN_PROC, KERN_PROC_PID
+    if libc.sysctl(mib, 4, buf, ctypes.byref(size), None, 0) != 0 or size.value == 0:
+        return None
+    # kp_proc.p_starttime, a struct timeval, opens the structure
+    sec = int.from_bytes(buf.raw[0:8], 'little')
+    usec = int.from_bytes(buf.raw[8:12], 'little')
+    return sec + usec / 1e6
 
 
 def session_of(pid):
@@ -239,6 +258,14 @@ CADDY = {
 
 LSOF = {
     'real': lambda: exec_real(REAL_LSOF),
+    # Hangs only when asked about a cloudflared the ledger knows (whatever
+    # way its PID is written among the arguments); every other call is real
+    'hangs-for-cloudflared': lambda: f'''while IFS='	' read -r name pid rest; do
+  if [ "$name" = cloudflared ]; then
+    case " $* " in *[!0-9]"$pid"[!0-9]*) exec /bin/sleep {STALL} ;; esac
+  fi
+done < "$LEDGER"
+{exec_real(REAL_LSOF)}''',
     'not-a-number': lambda: 'echo "n*:http"',
     'zero': lambda: 'echo "n*:0"',
     'too-big': lambda: 'echo "n*:65536"',
@@ -275,13 +302,70 @@ SCUTIL = {
 #   is ignored. It logs the tunnel URL at once and one more line a second
 #   later.
 #
+# Its tunnel address is reported the way the real one does it, also as
+# confirmed against the real binary: once the address is known, it is logged
+# and a metrics server opens on 127.0.0.1, on the first free port of
+# 20241-20245 (any free port if none is), answering GET /quicktunnel with
+# {"hostname":"<host>"}. Before that, nothing listens. `address` picks when
+# and what it reports:
+#
+#   'ok'       at once, stub-<PID>.trycloudflare.com
+#   'late'     the same, 3 seconds in
+#   'never'    no address at all: nothing logged, nothing listening
+#   '404'      logged, but /quicktunnel answers 404
+#   'not-json' logged, but /quicktunnel answers something else entirely
+#   'empty'    logged, but the hostname is empty
+#   'bad-host' logged, but the hostname has an escape sequence and a space
+#
+# It also notes, for the fixture's clock, when its address is about to become
+# available (.cloudflared-<PID>.ready next to it): just before, never after,
+# so a time measured from it can only come out longer. When it started is
+# the kernel's to say (process_start).
+#
 # 'stubborn' is not modelled on cloudflared: it ignores everything a process
 # can ignore, to exercise serve's last resort.
 CLOUDFLARED_STUB = """#!{python}
-import os, signal, sys, time
+import json, os, signal, sys, threading, time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 MODE = {mode!r}
+ADDRESS = {address!r}
 LIFETIME = {lifetime!r}
+HOST = 'stub-%d.trycloudflare.com' % os.getpid()
+NOTE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.cloudflared-%d.' % os.getpid())
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+def note(what):
+    with open(NOTE + what, 'w') as f:
+        f.write(repr(time.time()))
+
+ANSWERS = {{
+    'not-json': b'<html><body>metrics</body></html>',
+    'empty': b'{{"hostname":""}}',
+    'bad-host': b'{{"hostname":"stub\\x1b[31m x.trycloudflare.com"}}',
+}}
+
+class Metrics(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != '/quicktunnel' or ADDRESS == '404':
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = ANSWERS.get(ADDRESS) or json.dumps({{'hostname': HOST}}, separators=(',', ':')).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(body + b'\\n')
+    def log_message(self, *args):
+        pass
+
+def open_metrics():
+    for port in (20241, 20242, 20243, 20244, 20245, 0):
+        try:
+            server = HTTPServer(('127.0.0.1', port), Metrics)
+        except OSError:
+            continue
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return
 
 def log(msg):
     # a failed write (EIO once the terminal is gone) is shrugged off, as Go's
@@ -308,7 +392,12 @@ else:
     signal.signal(signal.SIGINT, graceful)
 
 log('INF Requesting new quick Tunnel on trycloudflare.com...')
-log('INF |  https://stub-%d.trycloudflare.com  |' % os.getpid())
+if ADDRESS == 'late':
+    time.sleep(3)
+if ADDRESS != 'never':
+    note('ready')
+    log('INF |  https://%s  |' % HOST)
+    open_metrics()
 time.sleep(1)
 log('INF Registered tunnel connection connIndex=0')
 time.sleep(LIFETIME)
@@ -316,19 +405,21 @@ time.sleep(LIFETIME)
 
 
 def write_shims(directory, ledger, caddy='real', lsof='real', scutil='real',
-                cloudflared='idle', missing=(), lifetime=STUB_LIFETIME):
-    """One shim per helper (ps included) in `directory`. `cloudflared` is a stub mode
-    ('idle', 'draining', 'stubborn') or 'real'; names in `missing` get no
-    shim, so serve cannot find them."""
+                cloudflared='idle', address='ok', missing=(), lifetime=STUB_LIFETIME):
+    """One shim per helper (ps and curl included) in `directory`.
+    `cloudflared` is a stub mode ('idle', 'draining', 'stubborn') or 'real',
+    `address` how the stub reports its tunnel address (see above); names in
+    `missing` get no shim, so serve cannot find them."""
     os.makedirs(directory, exist_ok=True)
     actions = {'caddy': CADDY[caddy](), 'lsof': LSOF[lsof](), 'scutil': SCUTIL[scutil](),
-               'ps': exec_real(REAL_PS)}
+               'ps': exec_real(REAL_PS), 'curl': exec_real(REAL_CURL)}
     if cloudflared == 'real':
         actions['cloudflared'] = exec_real(REAL_CLOUDFLARED)
     else:
         stub = os.path.join(directory, '.cloudflared-stub')
         with open(stub, 'w') as f:
-            f.write(CLOUDFLARED_STUB.format(python=PYTHON, mode=cloudflared, lifetime=lifetime))
+            f.write(CLOUDFLARED_STUB.format(python=PYTHON, mode=cloudflared, address=address,
+                                            lifetime=lifetime))
         os.chmod(stub, 0o755)
         actions['cloudflared'] = exec_real(stub)
     for name, action in actions.items():
@@ -336,7 +427,7 @@ def write_shims(directory, ledger, caddy='real', lsof='real', scutil='real',
             continue
         path = os.path.join(directory, name)
         with open(path, 'w') as f:
-            f.write(SHIM.format(name=name, ledger=q(ledger), action=action))
+            f.write(SHIM.format(name=name, ledger=q(ledger), action=action.replace('"$LEDGER"', q(ledger))))
         os.chmod(path, 0o755)
 
 
@@ -465,6 +556,21 @@ def listening(pid):
     out = subprocess.run([REAL_LSOF, '-nP', '-a', '-p', str(pid), '-iTCP', '-sTCP:LISTEN', '-Fn'],
                          capture_output=True, text=True).stdout
     return [line[1:] for line in out.splitlines() if line.startswith('n')]
+
+
+def stub_notes(directory):
+    """What the cloudflared stand-ins in `directory` noted: PID -> {'ready':
+    time}, in seconds since the epoch."""
+    out = {}
+    for name in os.listdir(directory):
+        m = re.fullmatch(r'\.cloudflared-(\d+)\.(ready)', name)
+        if m:
+            try:
+                with open(os.path.join(directory, name)) as f:
+                    out.setdefault(int(m.group(1)), {})[m.group(2)] = float(f.read())
+            except (OSError, ValueError):
+                pass              # still being written
+    return out
 
 
 def start_download(url):

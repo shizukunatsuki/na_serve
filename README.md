@@ -34,22 +34,31 @@ serve --help     # 打印用法
 
 ### 输出
 
-`serve` 自己往 stdout 写一个带边框的块，让它在服务的日志里一眼就能找到：
+`serve` 自己往 stdout 写带边框的块，让它们在服务的日志里一眼就能找到。启动完成时写
+第一个块；`--share` 时，隧道建好、拿到公网地址后（通常几秒），再写第二个：
 
 ```
 ━━━━━━━━━━━━━━━━━━━━ serve ━━━━━━━━━━━━━━━━━━━━
   Serving: /Users/you/some/dir
   Local:   http://your-mac.local:61234/
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━ serve ━━━━━━━━━━━━━━━━━━━━
+  Public:  https://some-random-words.trycloudflare.com/
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-- **`Serving:`**：被发布目录的绝对路径。stdout 是终端时显示为红色粗体（边框和 `Local:`
-  为粗体），重定向到文件或管道时不带任何控制序列。
+- **`Serving:`**：被发布目录的绝对路径。
 - **`Local:`**：局域网访问地址。主机名取自 macOS 的 LocalHostName（系统设置里"本地
   主机名"）。没有设置时改为 `http://localhost:端口/`，并在行尾注明原因。
+- **`Public:`**：仅 `--share`，公网访问地址，互联网上任何人都能访问。怎么得到的见
+  [公网地址](#公网地址)。
 
-这个块前面有一个空行，并且一次写出。所以即使恰好碰上某条日志只写了一半，块也会从新的
-一行开始，不会被日志拆开或接在日志后面。
+stdout 是终端时，`Serving:` 和 `Public:` 两行显示为红色粗体，边框和 `Local:` 为粗体；
+重定向到文件或管道时不带任何控制序列。
+
+每个块前面都有一个空行，并且一次写出。所以即使恰好碰上某条日志只写了一半，块也会从
+新的一行开始，不会被日志拆开或接在日志后面。
 
 stderr 上还有另外几类输出：
 
@@ -66,8 +75,11 @@ stderr 上还有另外几类输出：
   ```
 - **Caddy 和 cloudflared 的日志**：原样输出，所以终端里能看到 Caddy 启动和关闭的几行
   日志。
-- **公网隧道地址**：`--share` 时，隧道地址出现在 cloudflared 的日志里，形如
+- **公网隧道地址**：`--share` 时，隧道地址也会出现在 cloudflared 自己的日志里，形如
   `https://<随机单词>.trycloudflare.com`。
+- **读不到公网地址的提示**：`--share` 时 30 秒内一直读不到地址，打印
+  `serve: could not read the public address; look for it in cloudflared's log`，
+  然后照常服务。
 
 `serve` 自己的错误信息也写到 stderr，都以 `serve: ` 开头。
 
@@ -80,7 +92,7 @@ stderr 上还有另外几类输出：
 | 参数 | 行为 |
 | --- | --- |
 | （无） | 只发布到局域网。不启动 cloudflared，也不要求安装 cloudflared。 |
-| `--share` | 另外启动 cloudflared quick tunnel，指向 `http://localhost:端口`。可以重复写。 |
+| `--share` | 另外启动 cloudflared quick tunnel，指向 `http://localhost:端口`，并显示它的公网地址。可以重复写。 |
 | `-h`、`--help` | 把用法打印到 stdout，退出码 0，什么都不启动。 |
 | 其他任何参数 | stderr 打印 `serve: unknown option: <参数原文>` 和用法，退出码 2，什么都不启动。 |
 
@@ -91,8 +103,9 @@ stderr 上还有另外几类输出：
 
 启动按以下顺序进行，前三步失败时，什么都还没有启动：
 
-1. **检查依赖命令**：依次检查 `caddy`、`cloudflared`（仅 `--share`）、`scutil`、
-   `lsof`、`ps`。缺哪个，就打印 `serve: <命令> not found`，退出码 1。
+1. **检查依赖命令**：依次检查 `caddy`、`cloudflared` 和 `curl`（这两个仅
+   `--share`）、`scutil`、`lsof`、`ps`。缺哪个，就打印 `serve: <命令> not found`，
+   退出码 1。除了 Caddy 和 cloudflared，其余都是 macOS 自带的。
 2. **读取 LocalHostName**：通过 `scutil` 读取。
 3. **确认自己是进程组组长**：不是的话打印
    `serve: not a process group leader, refusing to start`，退出码 1。
@@ -116,7 +129,25 @@ stderr 上还有另外几类输出：
      退出码 1。
    - 这期间收到停止信号（见下一节），或者父进程已经退出：直接进入收尾，不打印任何
      内容，也不启动 cloudflared，退出码 0。
-7. **打印并开隧道**：打印 `Serving:` 和 `Local:` 两行；`--share` 时启动 cloudflared。
+7. **打印并开隧道**：打印 `Serving:` 和 `Local:` 两行；`--share` 时启动 cloudflared，
+   之后在运行中读取它的公网地址（见下一节）。
+
+### 公网地址
+
+`--share` 时，`serve` 向自己启动的那个 cloudflared 询问公网地址，而不是去解析它的日志：
+
+- **问谁**：cloudflared 拿到隧道地址后，会在本机开一个 metrics 服务（只监听
+  `127.0.0.1`），它的 `/quicktunnel` 接口返回隧道的主机名。`serve` 用 `lsof` 按
+  cloudflared 的 PID 找到这个端口，再用 `curl` 读取。
+- **多个实例互不干扰**：metrics 端口会依次尝试 20241–20245，都被占了就用随机端口，
+  所以每个实例的端口不同。`serve` 按 PID 找端口，读到的只可能是自己那条隧道的地址；
+  本机别的程序占着这些端口、报告别的地址，也不会被读到。
+- **什么时候显示**：运行中每 0.5 秒查一次，拿到后 1 秒内打印 `Public:` 块，只打印一次。
+- **只显示正常的主机名**：只接受由字母、数字、`-` 和 `.` 组成、不超过 253 个字符的
+  主机名，读到别的内容都当作"没读到"，不会原样打印到终端上。
+- **读不到**：cloudflared 启动 30 秒后仍然读不到时，打印一行提示，不再尝试；`serve` 照常
+  服务，地址可以在 cloudflared 的日志里找。如果 cloudflared 在这期间自己退出了，则按
+  "cloudflared 退出"停止。
 
 ### 什么时候停止
 
@@ -137,6 +168,9 @@ stderr 上还有另外几类输出：
   - `serve` 自己先写：它收到 `SIGPIPE`，按停止信号收尾，退出码 0。zsh 还会在 stderr
     上报几行 `write error: broken pipe`。
   - Caddy 或 cloudflared 先写：它被 `SIGPIPE` 结束，`serve` 按"服务退出"收尾，退出码 1。
+
+  `--share` 时，`serve` 拿到公网地址后还会再写一次 stdout，所以 `serve --share | head -2`
+  这样的用法会在那时停止。
 
   想保留输出又不影响运行，可以把输出交给一个不会提前退出的读端，比如
   `serve --share |& tee serve.log`。
@@ -208,6 +242,9 @@ stderr 上还有另外几类输出：
   同时运行时不会争抢同一个端口。
 - **读端口最多等 10 秒**：新装的程序第一次运行时，可能要先等 macOS 的安全扫描几秒
   才真正启动。
+- **公网地址向 cloudflared 询问，不解析日志**：日志是给人看的，格式不是稳定接口；要读
+  它，还得把 cloudflared 的输出改成经过 `serve` 转发，多出一层管道和随之而来的中断
+  问题。metrics 端口上的 `/quicktunnel` 是 cloudflared 专门提供的接口。
 - **隧道指向 `localhost` 而不是 `127.0.0.1`**：Caddy 用一个同时接受 IPv4 和 IPv6 的
   监听器，`localhost` 解析成哪个地址都能连上。
 - **组长检查直接问内核**：用 `kill -0 -$$` 判断。以自己 PID 为 ID 的进程组存在，
@@ -236,7 +273,9 @@ stderr 上还有另外几类输出：
     kill -KILL -<PGID>                                          # 按组结束
     ```
 - **`lsof` 卡死时，10 秒上限不起作用**：截止时间只在两次 `lsof` 调用之间检查，单次
-  调用卡死时 `serve` 会一直等。可以按 `Ctrl-C` 停止，收尾照常执行。
+  调用卡死时 `serve` 会一直等。可以按 `Ctrl-C` 停止，收尾照常执行。`--share` 时读
+  公网地址也用 `lsof`：它卡死时，服务照常运行，但 `Public:` 块不会出现，30 秒的提示
+  也不会出现；同样可以按 `Ctrl-C` 停止。
 - **`scutil` 卡死时，`serve` 停在启动之前**：可以按 `Ctrl-C` 退出，这时还什么都没有
   启动。
 - **必须是进程组组长才能运行**：所以不能在管道的非首位使用，也不能被没开 job

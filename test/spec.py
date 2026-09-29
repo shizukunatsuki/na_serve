@@ -14,7 +14,10 @@ phase      when the case's event fires:
              'none'     no event; serve ends (or keeps running) by itself
              'pretrap'  during startup step 2, before serve traps anything
              'startup'  during step 5, while serve waits for caddy's port
-             'running'  after startup, with everything up
+             'addrwait' (--share only) after startup, while serve waits for
+                        the tunnel's address, which never comes
+             'running'  after startup, with everything up (and, with
+                        --share, the tunnel's address shown)
              'cleanup'  one second into a cleanup started by Ctrl-C
 behaviour  how serve's children take being stopped:
              'idle'     nothing in flight: they exit on the first signal
@@ -65,6 +68,9 @@ QUICK = (0.0, 0.5)         # DEP-1, PRE-1: nothing to wait for
 PORT_GONE = (0.0, 2.0)     # PORT-2
 PIPE_BOTH = (0.0, 2.5)     # PIPE-2, PIPE-3, from serve's start
 PIPE_SERVICE = (0.0, 3.5)  # PIPE-4, from serve's start
+PUBLIC = 1.0               # PUB-1, from the tunnel's address becoming available
+PUBLIC_GIVE_UP = (30.0, 31.5)  # PUB-3, from cloudflared's start
+PIPE_PUBLIC = (0.0, 2.0)   # PIPE-1 with --share, from the address becoming available
 LEFTOVER = 1.0             # PROC-1, PROC-2: how long the last processes may take
 
 
@@ -91,7 +97,7 @@ class Case:
         plan.append('PROC-2' if expect.get('ends') == 'leaks' else 'PROC-1')
         plan.append('PROC-3')
         if kind == 'lifecycle' and phase in ('running', 'cleanup'):
-            plan.extend(BUSINESS + (('TUN-1',) if mode == 'share' else ()))
+            plan.extend(BUSINESS + (('TUN-1', 'PUB-1') if mode == 'share' else ()))
         self.plan = tuple(dict.fromkeys(plan))
         self.kind = kind
         self.mode = mode
@@ -140,13 +146,16 @@ def argument_cases():
                phase='running', event=('key', '^C'), ends='itself', exit=0)
     yield Case('args/no cloudflared installed, no --share', ('ARG-5', 'STOP-1', 'CLEAN-1'), mode='lan', shims={'missing': ('cloudflared',)},
                phase='running', event=('key', '^C'), ends='itself', exit=0)
+    # DEP-1 only asks for curl with --share
+    yield Case('args/no curl installed, no --share', ('DEP-1', 'STOP-1', 'CLEAN-1'), mode='lan', shims={'missing': ('curl',)},
+               phase='running', event=('key', '^C'), ends='itself', exit=0)
 
 
 # -------------------------------------------------------------------- startup
 
 def dependency_cases():
     for mode in MODES:
-        needed = ('caddy', 'cloudflared', 'scutil', 'lsof', 'ps') if mode == 'share' else ('caddy', 'scutil', 'lsof', 'ps')
+        needed = ('caddy', 'cloudflared', 'curl', 'scutil', 'lsof', 'ps') if mode == 'share' else ('caddy', 'scutil', 'lsof', 'ps')
         for cmd in needed:
             yield Case(f'startup/{mode}/missing {cmd}', 'DEP-1', mode=mode, shims={'missing': (cmd,)},
                        phase='none', ends='itself', exit=1, window=QUICK, messages=(f'serve: {cmd} not found',),
@@ -266,8 +275,13 @@ def pipe_cases():
     for mode in MODES:
         yield Case(f'output/{mode}/| cat (plain text, no colour)', ('OUT-2', 'STOP-1', 'CLEAN-1'), mode=mode, pipe=' | cat',
                    phase='running', event=('key', '^C'), ends='itself', exit=0, stdout_tty=False)
-        yield Case(f'output/{mode}/| head -2 (reader leaves, nothing more is written)', 'PIPE-1', mode=mode,
-                   pipe=' | head -2', phase='none', ends='continues', then='ctrl-c', exit=0, stdout_tty=False)
+        if mode == 'lan':
+            yield Case(f'output/{mode}/| head -2 (reader leaves, nothing more is written)', 'PIPE-1', mode=mode,
+                       pipe=' | head -2', phase='none', ends='continues', then='ctrl-c', exit=0, stdout_tty=False)
+        else:
+            yield Case(f'output/{mode}/| head -2 (reader leaves, the Public: block finds it gone)', 'PIPE-1',
+                       mode=mode, pipe=' | head -2', phase='none', ends='itself', exit=0, window=PIPE_PUBLIC,
+                       since='address', messages=('write error: broken pipe',))
         yield Case(f'output/{mode}/| true (serve writes first)', 'PIPE-2', mode=mode, pipe=' | true',
                    phase='none', ends='itself', exit=0, window=PIPE_BOTH, messages=('write error: broken pipe',))
         yield Case(f'output/{mode}/|& true (whoever writes first)', 'PIPE-3', mode=mode, pipe=' |& true',
@@ -305,9 +319,30 @@ def limitation_cases():
         yield Case(f'startup/{mode}/scutil hangs', 'LIM-2', mode=mode, shims={'scutil': 'hangs'},
                    phase='none', ends='continues', then='ctrl-c', hold=2, exit=130, printed=False,
                    nothing_started=True)
+    yield Case('running/share/lsof hangs reading the address', ('LIM-4', 'STOP-1', 'CLEAN-1'), mode='share',
+               shims={'lsof': 'hangs-for-cloudflared'}, phase='none', ends='continues', then='ctrl-c', hold=3,
+               exit=0, public=False, serving=True)
     yield Case('cleanup/share/stubborn/signal:KILL during cleanup skips the rest', 'LIM-3', mode='share',
                behaviour='stubborn', phase='cleanup', event=('key', '^C'), second=('signal', 'KILL'),
                ends='leaks', exit=137, window=QUICK)
+
+
+# ------------------------------------------------------------ public address
+
+def public_cases():
+    # PUB-1: shown, whether the address comes at once or seconds later
+    for address in ('ok', 'late'):
+        yield Case(f'public/share/address {"at once" if address == "ok" else "3 s in"} is shown',
+                   ('PUB-1', 'STOP-1', 'CLEAN-1'), kind='public', mode='share', shims={'address': address})
+    # PUB-3: never readable, however it fails
+    for address in ('never', '404', 'not-json', 'empty', 'bad-host'):
+        yield Case(f'public/share/address {address}: serve says so and keeps serving',
+                   ('PUB-3', 'STOP-1', 'CLEAN-1'), kind='public', mode='share', shims={'address': address})
+    # PUB-4: stopped while still waiting for it
+    for event in STOP_EVENTS:
+        yield Case(f'addrwait/share/{event_id(event)} while waiting for the address', ('PUB-4', 'CLEAN-1'),
+                   mode='share', shims={'address': 'never'}, phase='addrwait', event=event, ends='itself',
+                   exit=0 if observable(event) else None, window=WINDOW['idle'], public=False)
 
 
 # ------------------------------------------------------------ usage and output
@@ -320,8 +355,10 @@ def warning_cases():
 
 def usage_cases():
     for mode in MODES:
-        yield Case(f'usage/{mode}/three instances at once', 'MULTI-1', kind='concurrency', mode=mode)
-        yield Case(f'output/{mode}/streams', ('OUT-1', 'OUT-4') if mode == 'share' else 'OUT-1', kind='streams', mode=mode)
+        yield Case(f'usage/{mode}/three instances at once', ('MULTI-1', 'PUB-2') if mode == 'share' else 'MULTI-1',
+                   kind='concurrency', mode=mode)
+        yield Case(f'output/{mode}/streams', ('OUT-1', 'OUT-4', 'PUB-1') if mode == 'share' else 'OUT-1',
+                   kind='streams', mode=mode)
 
 
 def tunnel_cases():
@@ -341,7 +378,7 @@ def all_cases(real_tunnel=False):
     out = []
     for gen in (argument_cases, dependency_cases, hostname_cases, leader_cases, port_cases, pretrap_cases,
                 running_cases, other_signal_cases, ctrl_z_cases, pipe_cases, cleanup_cases,
-                limitation_cases, warning_cases, usage_cases):
+                limitation_cases, public_cases, warning_cases, usage_cases):
         out.extend(gen())
     ids = [c.id for c in out]
     assert len(ids) == len(set(ids)), 'duplicate case ids'
