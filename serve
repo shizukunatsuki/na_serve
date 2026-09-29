@@ -21,6 +21,13 @@ setopt nobgnice
 
 zmodload zsh/system zsh/zselect || exit 1
 
+# Until the services start, a stop signal simply ends serve: there is nothing
+# to clean up yet. The default action does that for most of them, but zsh
+# ignores QUIT and turns HUP into exit 1, so those two get the same end as
+# the rest (128 + the signal number). The cleanup traps below replace these.
+trap 'exit 131' QUIT
+trap 'exit 129' HUP
+
 # The public tunnel is opt-in: exposing a directory to the whole internet
 # should never be what happens by default.
 typeset arg share=0
