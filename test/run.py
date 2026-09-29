@@ -53,7 +53,18 @@ def plan_coverage():
     problems = [f'plan item {i} is not checked by any case' for i in sorted(items - cited)]
     problems += [f'cases cite {i}, which is not in the plan' for i in sorted(cited - items)]
     return problems
-MARGIN = 1.0                  # added to upper time bounds; raised with -j
+# PLAN.md section 5: added to every upper time bound, however many cases run
+# at once (measured parallel runs were no slower than serial ones)
+MARGIN = 0.5
+# PLAN.md section 5: a timing failure fails the case, but the machine itself
+# stalls now and then, so it may not be serve's fault
+STALL_NOTE = ('  [a whole-machine stall can also cause this: a longest fixture gap well over 0.1s '
+              'points that way; see PLAN.md section 5]')
+# How long "nothing left behind" (PROC-1, PROC-2) may take once serve is gone
+LEFTOVER_WAIT = spec.LEFTOVER + MARGIN
+# ... and when serve has only just been told to stop (CLEAN-1 first)
+STOP_AND_LEFTOVER_WAIT = spec.WINDOW['idle'][1] + spec.LEFTOVER + 2 * MARGIN
+DECOY_LIFETIME = 300          # far longer than any case; finite if a run crashes
 
 
 class Failed(Exception):
@@ -77,15 +88,17 @@ class World:
             f.write('dotfile')
         os.link(big, os.path.join(self.site, 'big.bin'))
         self.shims = os.path.join(self.dir, 'bin')
-        self.ledger = fx.Ledger(os.path.join(self.dir, 'ledger'))
+        self.sids = []
+        self.ledger = fx.Ledger(os.path.join(self.dir, 'ledger'), self.sids)
         shims = dict(case.shims)
         missing = shims.pop('missing', ())
         fx.write_shims(self.shims, self.ledger.path, missing=missing, **shims)
         self.failures = []
+        self.measured = {}          # timings, for --timings
         self.downloads = []
         self.term = None
         self.serve = None           # (pid, lstart) once known
-        self.sids = []
+        self.peers = {}             # serve's pipeline peers: PID -> start time
 
     # -- setup / teardown
 
@@ -93,7 +106,7 @@ class World:
         t = fx.Terminal()
         self.sids.append(t.sid)
         mark = t.mark()
-        t.run("(trap '' HUP; exec /bin/sleep 3600) & print DECOY=$!")
+        t.run(f"(trap '' HUP; exec /bin/sleep {DECOY_LIFETIME}) & print DECOY=$!")
         m = t.expect(r'DECOY=(\d+)', 5, mark)
         if not m:
             raise Failed('decoy never started')
@@ -156,19 +169,29 @@ class World:
         return (int(m.group(1)), m.group(2)) if m else None
 
     def serve_identity(self, timeout=5):
-        """serve's PID, from the first thing it ran: scutil, run in a command
-        substitution, has serve itself as its parent."""
+        """serve's PID and start time. serve is the child of the shell it was
+        started from that leads a process group of its own: the interactive
+        shell puts each job in a group led by its first process, and the only
+        other such child is the decoy. (Nothing about serve's own children is
+        relied on: whether zsh runs a command substitution in a subshell, for
+        one, is up to zsh and changes with serve's traps.)"""
         if self.serve:
             return self.serve
+        t = self.term
+        if t is None:
+            return None
         found = []
 
         def look():
-            e = self.ledger.first('scutil')
-            if e:
-                p = fx.proc_table().get(e.ppid)
-                if p:
-                    found.append((e.ppid, p.lstart))
-                    return True
+            table = fx.proc_table()
+            leaders = [p for p in table.values()
+                       if p.ppid == t.shell and p.pid == p.pgid and p.pid not in (t.decoy, t.nested)]
+            if len(leaders) == 1:
+                found.append((leaders[0].pid, leaders[0].lstart))
+                # the rest of serve's job: its pipeline peers (plan, PROC-1)
+                self.peers.update({p.pid: p.lstart for p in table.values()
+                                   if p.ppid == t.shell and p.pgid == leaders[0].pid and p.pid != leaders[0].pid})
+                return True
             return False
         fx.wait_until(look, timeout)
         self.serve = found[0] if found else None
@@ -197,7 +220,7 @@ class World:
                 if t_ps > 0.3:
                     self.timeline.append(f'(ps took {t_ps:.1f}s)')
                 alive = [f'{e.name}:{table[e.pid].stat}' for e in self.ledger.entries()
-                         if e.name in ('caddy', 'cloudflared') and fx.running(e, table)]
+                         if e.name in ('caddy', 'cloudflared') and self.ledger.running(e, table)]
                 if self.serve_alive(table):
                     alive.insert(0, f'serve:{table[self.serve[0]].stat}')
                 self.timeline.append(f'{now - start[0]:.1f}s ' + (' '.join(alive) or '-'))
@@ -212,7 +235,8 @@ class World:
             keep |= {t.pid, t.decoy, t.nested or -1}
         out = {}
         for sid in self.sids:
-            out.update({pid: p for pid, p in fx.session_members(sid, table).items() if pid not in keep})
+            out.update({pid: p for pid, p in fx.session_members(sid, table).items()
+                        if pid not in keep and self.peers.get(pid) != p.lstart})
         return out
 
     def describe_states(self, procs):
@@ -223,10 +247,17 @@ class World:
         return getattr(self, 'terms', None) or ([self.term] if self.term else [])
 
     def ledger_running(self, table=None):
-        table = fx.proc_table() if table is None else table
-        return [e for e in self.ledger.entries() if fx.running(e, table)]
+        return self.ledger.still_running(table)
 
-    def wait_clean(self, timeout=3.0):
+    def timed_clean(self, key, timeout=None):
+        """wait_clean, recording how long it took (for --timings)."""
+        t0 = time.time()
+        ok = self.wait_clean(LEFTOVER_WAIT if timeout is None else timeout)
+        if ok:
+            self.measured[key] = round(time.time() - t0, 3)
+        return ok
+
+    def wait_clean(self, timeout):
         fx.wait_until(lambda: not self.leftovers() and not self.ledger_running(), timeout, 0.1)
         return not self.leftovers() and not self.ledger_running()
 
@@ -237,7 +268,8 @@ class World:
     # -- business (README: output, startup steps 4-6, security, process boundary)
 
     def business(self, t, stdout_tty=True, host=None, via_tunnel=False):
-        """Everything the README says holds while serve is up; returns the port."""
+        """Everything the plan says holds while serve is up (OUT-2, OUT-3, NET-1..3,
+        TUN-1): outside behaviour only, not how serve achieves it. Returns the port."""
         text = t.text(self.mark)
         raw = t.raw[self.mark:]
         m = re.search(r'Local: (http://(\S+?):(\d+)/)(.*)', text)
@@ -248,22 +280,18 @@ class World:
         self.check(host_seen == want_host or f'{host_seen} (want {want_host})', 'Local: host')
         if want_host == 'localhost':
             self.check('LocalHostName is not set' in rest, 'Local: says why there is no .local name')
-        self.check(re.search(r'(?m)^Serving: ' + re.escape(self.site) + r'$', text) is not None
+        # On the terminal, stdout and stderr share one screen: a caddy log line
+        # written at the same moment may come right before this one, so only
+        # the line's end is anchored here (OUT-1's exact lines are checked on
+        # stdout alone, by the streams case)
+        self.check(re.search(r'Serving: ' + re.escape(self.site) + r'$', text, re.M) is not None
                    or [l for l in text.splitlines() if 'Serving' in l], 'Serving: names the directory')
         self.check((fx.RED + b'Serving: ' in raw) == stdout_tty,
                    'Serving: in bold red exactly when stdout is a terminal')
-        sp = self.serve_identity()
-        table = fx.proc_table()
-        self.check(sp is not None and table.get(sp[0]) is not None and table[sp[0]].pgid == sp[0],
-                   'serve leads its own process group')
         caddy = self.ledger.entries('caddy')
         self.check(len(caddy) == 1 or f'{len(caddy)} launched', 'caddy launched once')
         if caddy:
-            c = caddy[0]
-            self.check(c.args == 'file-server --browse --listen :0' or c.args, 'caddy arguments')
-            self.check(c.pgid == sp[0] if sp else False, 'caddy in serve\'s group')
-            self.check(fx.session_of(c.pid) == t.sid, 'caddy in the terminal\'s session')
-            socks = fx.listening(c.pid)
+            socks = fx.listening(caddy[0].pid)
             self.check(socks == [f'*:{port}'] or socks, 'caddy listens on one socket, all interfaces, printed port')
         for name, base in (('127.0.0.1', f'http://127.0.0.1:{port}'), ('[::1]', f'http://[::1]:{port}'),
                            (want_host, f'http://{want_host}:{port}')):
@@ -275,9 +303,14 @@ class World:
         if self.case.mode == 'share':
             self.check(len(cf) == 1 or f'{len(cf)} launched', 'cloudflared launched once')
             if cf:
-                self.check(cf[0].args == f'tunnel --url http://localhost:{port}' or cf[0].args,
-                           'cloudflared tunnel --url http://localhost:PORT')
-                self.check(cf[0].pgid == sp[0] if sp else False, 'cloudflared in serve\'s group')
+                # where the tunnel forwards to must be this instance, serving
+                # this directory; which spelling of the local address is used
+                # is serve's business
+                target = re.search(r'--url (\S+)', cf[0].args)
+                target = target.group(1).rstrip('/') if target else None
+                ok = bool(target) and target.endswith(f':{port}') and \
+                    fx.http_get(f'{target}/who.txt') == self.content.encode()
+                self.check(ok or cf[0].args, 'the tunnel forwards to this instance, serving this directory')
             if self.case.shims.get('cloudflared') == 'real':
                 u = t.expect(r'https://[a-z0-9-]+\.trycloudflare\.com', 40, self.mark)
                 self.check(bool(u), 'tunnel URL in cloudflared\'s log')
@@ -336,11 +369,6 @@ def run_lifecycle(w):
         if c.mode == 'share':
             fx.wait_until(lambda: w.ledger.first('cloudflared'), 5)
         port = w.business(t, stdout_tty=stdout_tty, host=e.get('host'), via_tunnel=e.get('via_tunnel'))
-        if e.get('tee'):
-            peers = [p for p in fx.session_members(t.sid, fx.proc_table(commands=True)).values()
-                     if p.command.startswith('tee ')]
-            sp = w.serve_identity()
-            w.check(bool(peers) and all(p.pgid == sp[0] for p in peers), 'tee is in serve\'s process group')
         if c.behaviour == 'draining':
             base = getattr(w, 'tunnel', None) if e.get('via_tunnel') else f'http://127.0.0.1:{port}'
             w.downloads.append(fx.start_download(f'{base}/big.bin'))
@@ -384,8 +412,11 @@ def run_lifecycle(w):
         if report:
             dt, source = report[0] - t_ref, 'reported by the shell'
         if gone and dt is not None:
-            w.check(lo <= dt <= hi + MARGIN or f'{dt:.2f}s ({source}), want {lo}-{hi}; timeline: '
-                    + ' | '.join(w.timeline), 'serve ends in time')
+            w.measured['stop'] = round(dt, 3)
+            w.measured['stop_source'] = source
+            w.check(lo <= dt <= hi + MARGIN or f'{dt:.2f}s ({source}), want {lo}-{hi}; longest fixture '
+                    f'gap so far {fx.MAX_GAP[0]:.2f}s; timeline: ' + ' | '.join(w.timeline) + STALL_NOTE,
+                    'serve ends in time')
         elif gone:
             w.check(False, 'serve\'s end could be timed')
         if shell_alive:
@@ -394,7 +425,7 @@ def run_lifecycle(w):
             if want is not None:
                 ok = got is not None and (got[0] in want if isinstance(want, tuple) else got[0] == want)
                 w.check(ok or f'got {got and got[0]}, want {want}', 'exit status')
-        w.check(w.wait_clean(3.0) or w.describe(w.leftovers()), 'nothing left behind')
+        w.check(w.timed_clean('clean_after') or w.describe(w.leftovers()), 'nothing left behind')
 
     elif ends == 'continues':
         fx.sleep(e.get('hold', 1.5))
@@ -434,10 +465,17 @@ def run_lifecycle(w):
         lo, hi = spec.WINDOW[c.behaviour]
         if w.serve:
             w.check(w.wait_serve_gone(hi + MARGIN + 1), 'serve stops on Ctrl-C')
+        report = w.end_report(t, 5, since=stop_mark)
+        if report:
+            dt = report[0] - t_stop
+            w.measured['stop'] = round(dt, 3)
+            w.measured['stop_source'] = 'reported by the shell'
+            w.check(lo <= dt <= hi + MARGIN or f'{dt:.2f}s, want {lo}-{hi}; longest fixture gap so far '
+                    f'{fx.MAX_GAP[0]:.2f}s' + STALL_NOTE, 'serve ends in time after Ctrl-C')
         got = w.query_exit(t, timeout=10, since=stop_mark)
         w.check(got is not None and got[0] == e['exit'] or f'got {got and got[0]}, want {e["exit"]}',
                 'exit status after Ctrl-C')
-        w.check(w.wait_clean(3.0) or w.describe(w.leftovers()), 'nothing left behind')
+        w.check(w.timed_clean('clean_after') or w.describe(w.leftovers()), 'nothing left behind')
 
     elif ends == 'leaks':
         gone = w.wait_serve_gone(e['window'][1] + MARGIN)
@@ -452,8 +490,8 @@ def run_lifecycle(w):
         w.check(all(p.pgid == sp for p in left.values()) or w.describe(left),
                 'everything left is in serve\'s original group')
         if sp:
-            os.killpg(sp, signal.SIGKILL)                    # the README's remedy
-        w.check(w.wait_clean(3.0) or w.describe(w.leftovers()), 'kill -KILL -<PGID> clears it')
+            os.killpg(sp, signal.SIGKILL)                    # PROC-2's remedy
+        w.check(w.timed_clean('remedy') or w.describe(w.leftovers()), 'kill -KILL -<PGID> clears it')
 
     # ---- facts about what did or did not happen
     text = t.text(w.mark)
@@ -498,7 +536,7 @@ def run_args(w):
     w.launch(t, pipe=f' {hide}')
     w.query_exit(t)
     w.check(e['text'].strip() in t.text(w.mark), f'written to {e["stream"]}')
-    w.check(w.wait_clean(1.0) or w.describe(w.leftovers()), 'nothing left behind')
+    w.check(w.wait_clean(LEFTOVER_WAIT) or w.describe(w.leftovers()), 'nothing left behind')
 
 
 def run_leader(w):
@@ -517,12 +555,17 @@ def run_leader(w):
         script = f'cd {fx.q(w.site)}; {fx.q(fx.SERVE)}' + ('; exit $?' if how == 'script' else '')
         p = subprocess.Popen(['/bin/zsh', '-fc', script], env=env, stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        fx.register_session(p.pid)
         w.sids.append(p.pid)
         if how == 'exec':
             ok = fx.wait_until(lambda: w.ledger.first('caddy'), 10)
             w.check(ok, 'serve starts')
-            w.serve_identity()
-            w.check(w.serve is not None and w.serve[0] == p.pid, 'serve took over the script\'s process')
+            # serve starts caddy itself, so caddy's parent is serve: the
+            # script's own process, if serve replaced it
+            me = fx.proc_table().get(p.pid)
+            if me:
+                w.serve = (p.pid, me.lstart)
+            w.check(ok and w.ledger.first('caddy').ppid == p.pid, 'serve took over the script\'s process')
             port = None
             if fx.wait_until(lambda: fx.listening(w.ledger.first('caddy').pid), 10):
                 port = int(fx.listening(w.ledger.first('caddy').pid)[0].rsplit(':', 1)[1])
@@ -538,7 +581,7 @@ def run_leader(w):
         w.check(msg in text, f'message "{msg}"')
     if how != 'exec':
         w.check(not w.ledger.entries('caddy'), 'no service started')
-    w.check(w.wait_clean(3.0) or w.describe(w.leftovers()), 'nothing left behind')
+    w.check(w.wait_clean(STOP_AND_LEFTOVER_WAIT) or w.describe(w.leftovers()), 'nothing left behind')
 
 
 def run_concurrency(w):
@@ -564,7 +607,7 @@ def run_concurrency(w):
     w.check(fx.http_get(f'http://127.0.0.1:{ports[1]}/who.txt').startswith(b'ERROR'), 'the stopped one is gone')
     for i in (0, 2):
         w.terms[i].send(KEYS['^C'])
-    w.check(w.wait_clean(5.0) or w.describe(w.leftovers()), 'nothing left behind')
+    w.check(w.wait_clean(STOP_AND_LEFTOVER_WAIT) or w.describe(w.leftovers()), 'nothing left behind')
     w.check(all(fx.proc_table().get(t.decoy) for t in w.terms), 'decoys untouched')
 
 
@@ -582,7 +625,7 @@ def run_streams(w):
     t.send(KEYS['^C'])
     w.wait_serve_gone(5)
     w.serve = None
-    w.ledger = fx.Ledger(w.ledger.path)
+    w.ledger = fx.Ledger(w.ledger.path, w.sids)
     fx.sleep(0.5)
     w.launch(t)
     t.expect(r'Local: http://', 15, w.mark)
@@ -593,7 +636,7 @@ def run_streams(w):
         w.check(re.search(r'INF \|  https://\S+\.trycloudflare\.com  \|', loud) is not None,
                 'tunnel URL in cloudflared\'s log')
     t.send(KEYS['^C'])
-    w.check(w.wait_clean(5.0) or w.describe(w.leftovers()), 'nothing left behind')
+    w.check(w.wait_clean(STOP_AND_LEFTOVER_WAIT) or w.describe(w.leftovers()), 'nothing left behind')
 
 
 RUNNERS = {'lifecycle': run_lifecycle, 'args': run_args, 'leader': run_leader,
@@ -602,6 +645,7 @@ RUNNERS = {'lifecycle': run_lifecycle, 'args': run_args, 'leader': run_leader,
 
 def run_case(case, root, big):
     w = World(case, root, big)
+    fx.MAX_GAP[0] = 0.0
     t0 = time.time()
     try:
         RUNNERS[case.kind](w)
@@ -616,7 +660,9 @@ def run_case(case, root, big):
         except Exception:
             pass
         w.teardown()
-    return {'id': case.id, 'plan': case.plan, 'failures': w.failures,
+    w.measured['max_gap'] = round(fx.MAX_GAP[0], 3)
+    return {'id': case.id, 'plan': case.plan, 'failures': w.failures, 'measured': w.measured,
+            'behaviour': case.behaviour, 'phase': case.phase,
             'seconds': round(time.time() - t0, 1), 'sids': w.sids}
 
 
@@ -638,7 +684,8 @@ class Bystander:
     own: no case may disturb it."""
 
     def __init__(self, root, big):
-        self.case = spec.Case('bystander', 'PROC-3', mode='share')
+        # its cloudflared stand-in has to last the whole run
+        self.case = spec.Case('bystander', 'PROC-3', mode='share', shims={'lifetime': 3600})
         self.w = World(self.case, root, big)
         self.t = self.w.open_terminal()
         self.w.term = self.t
@@ -653,12 +700,12 @@ class Bystander:
     def healthy(self):
         fx.pump_all()
         table = fx.proc_table()
-        return (all(fx.running(p, table) for p in self.procs) and self.w.serve_alive(table)
+        return (all(self.w.ledger.running(p, table) for p in self.procs) and self.w.serve_alive(table)
                 and fx.http_get(f'http://127.0.0.1:{self.port}/who.txt') == self.w.content.encode())
 
     def stop(self):
         self.t.send(KEYS['^C'])
-        clean = self.w.wait_clean(5.0)
+        clean = self.w.wait_clean(STOP_AND_LEFTOVER_WAIT)
         self.w.teardown()
         return clean
 
@@ -670,6 +717,7 @@ def main():
     ap.add_argument('--list', action='store_true', help='list the cases and exit')
     ap.add_argument('--real-tunnel', action='store_true', help='run the real-tunnel cases instead')
     ap.add_argument('--serve', metavar='PATH', help='test this script instead of ../serve')
+    ap.add_argument('--timings', metavar='FILE', help='also write every case\'s result and timings as JSON')
     opts = ap.parse_args()
     if opts.serve:
         os.environ['NA_SERVE_UNDER_TEST'] = fx.SERVE = os.path.abspath(opts.serve)
@@ -687,13 +735,23 @@ def main():
         sys.exit('caddy not found on PATH (brew install caddy)')
     if opts.real_tunnel and not fx.REAL_CLOUDFLARED:
         sys.exit('cloudflared not found on PATH (brew install cloudflared)')
-    margin = MARGIN + 0.25 * max(0, opts.j - 1)
+    margin = MARGIN
+
+    # However the run is stopped, it has to get to its cleanup: Ctrl-C even if
+    # SIGINT was ignored when it started (as for a background job of a script),
+    # and TERM or HUP the same way
+    def interrupted(sig, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
 
     root = tempfile.mkdtemp(prefix='na_serve_test_')
+    sessions_file = os.environ['NA_SESSIONS_FILE'] = os.path.join(root, 'sessions')
     big = os.path.join(root, 'big.bin')
     with open(big, 'wb') as f:
         f.write(os.urandom(64 << 20))
-    results, bystander_ok = [], True
+    results, bystander_ok, bystander = [], True, None
     started = time.time()
     try:
         bystander = Bystander(root, big)
@@ -725,10 +783,19 @@ def main():
                     for f in r['failures']:
                         print(f'             - {f}', flush=True)
         bystander_ok = bystander.stop() and bystander_ok
+        bystander = None
     finally:
+        # An interrupted or failed run still has its bystander up: its session
+        # goes too (decoy included)
+        if bystander is not None:
+            bystander.w.teardown()
         # Anything still in a session this run created is the fixture's own
-        # leftover, whatever the cases concluded
+        # leftover, whatever the cases concluded; a run cut short also has the
+        # sessions of the cases that were still running
         sids = {sid for r in results for sid in r['sids']}
+        if os.path.exists(sessions_file):
+            with open(sessions_file) as f:
+                sids |= {int(l) for l in f if l.strip()}
         stray = {pid: p for pid, p in fx.proc_table().items() if fx.session_of(pid) in sids}
         stray = {pid: fx.commands([pid]).get(pid, '?') for pid in stray}
         for pid in stray:
@@ -739,6 +806,10 @@ def main():
         shutil.rmtree(root, ignore_errors=True)
 
     failed = [r for r in results if r['failures']]
+    if opts.timings:
+        import json
+        with open(opts.timings, 'w') as f:
+            json.dump({'jobs': opts.j, 'margin': margin, 'results': results}, f, indent=1)
     print()
     if any(c.expect.get('crashes') for c in cases):
         print(f'reminder: this run crashed processes on purpose between {time.strftime("%Y-%m-%d %H:%M", time.localtime(started))}'
@@ -753,6 +824,10 @@ def main():
         print(f'FAIL {r["id"]}  [{" ".join(r["plan"])}]')
         for f in r['failures']:
             print(f'     - {f}')
+    if any('in time' in f for r in failed for f in r['failures']):
+        print('\nnote: some failures are timing failures. They count as failures, but a whole-machine stall '
+              'can cause them too, so they do not by themselves prove serve wrong: check each one\'s longest '
+              'fixture gap, and rerun that case alone if in doubt (PLAN.md section 5).')
     sys.exit(0 if not failed and bystander_ok and not stray else 1)
 
 

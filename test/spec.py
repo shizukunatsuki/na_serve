@@ -54,12 +54,18 @@ CORE_SIGNALS = set('QUIT ILL TRAP ABRT EMT FPE BUS SEGV SYS'.split())
 STOP_EVENTS = ([('key', '^C'), ('key', '^\\'), ('hangup',)]
                + [('signal', s) for s in STOP_SIGNALS])
 
+# Time bounds, in seconds; PLAN.md section 4 says where each comes from.
+# run.py adds the plan's fixed tolerance to every upper bound.
 # CLEAN-1..3: from the stop event to serve's exit, by how the services take
-# being stopped (run.py widens upper bounds under parallel load, plan section 5)
-WINDOW = {'idle': (0.0, 1.5), 'draining': (0.0, 2.5), 'stubborn': (4.5, 6.5)}
+# being stopped
+WINDOW = {'idle': (0.0, 1.0), 'draining': (0.0, 2.0), 'stubborn': (5.0, 6.5)}
 CLEAN = {'idle': 'CLEAN-1', 'draining': 'CLEAN-2', 'stubborn': 'CLEAN-3'}
-NESTED_EXTRA = 0.5         # STOP-3: added when the dead parent is not the session leader
-PORT_WAIT = (9.5, 11.5)    # PORT-1
+PORT_WAIT = (10.0, 11.5)   # PORT-1, from serve's start
+QUICK = (0.0, 0.5)         # DEP-1, PRE-1: nothing to wait for
+PORT_GONE = (0.0, 2.0)     # PORT-2
+PIPE_BOTH = (0.0, 2.5)     # PIPE-2, PIPE-3, from serve's start
+PIPE_SERVICE = (0.0, 3.5)  # PIPE-4, from serve's start
+LEFTOVER = 1.0             # PROC-1, PROC-2: how long the last processes may take
 
 
 def signum(name):
@@ -71,7 +77,7 @@ def event_id(event):
 
 
 # Checked by run.py in every running-phase lifecycle case, before its event
-BUSINESS = ('OUT-2', 'OUT-3', 'NET-1', 'NET-2', 'NET-3', 'NET-4')
+BUSINESS = ('OUT-2', 'OUT-3', 'NET-1', 'NET-2', 'NET-3')
 
 
 class Case:
@@ -143,7 +149,7 @@ def dependency_cases():
         needed = ('caddy', 'cloudflared', 'scutil', 'lsof') if mode == 'share' else ('caddy', 'scutil', 'lsof')
         for cmd in needed:
             yield Case(f'startup/{mode}/missing {cmd}', 'DEP-1', mode=mode, shims={'missing': (cmd,)},
-                       phase='none', ends='itself', exit=1, window=(0, 2), messages=(f'serve: {cmd} not found',),
+                       phase='none', ends='itself', exit=1, window=QUICK, messages=(f'serve: {cmd} not found',),
                        printed=False, nothing_ran=True)
 
 
@@ -165,7 +171,7 @@ def leader_cases():
 def port_cases():
     for mode in MODES:
         yield Case(f'startup/{mode}/caddy exits at once', 'PORT-2', mode=mode, shims={'caddy': 'exits'},
-                   phase='none', ends='itself', exit=1, window=(0, 2), messages=('serve: caddy failed to start',),
+                   phase='none', ends='itself', exit=1, window=PORT_GONE, messages=('serve: caddy failed to start',),
                    printed=False, cf=False)
         yield Case(f'startup/{mode}/caddy never listens', 'PORT-1', mode=mode, shims={'caddy': 'never-listens'},
                    phase='none', ends='itself', exit=1, window=PORT_WAIT,
@@ -192,9 +198,11 @@ def pretrap_cases():
             # before the trap, serve dies of a core signal sent to it; Ctrl-\
             # also reaches the scutil it waits on, which does
             crashes = name in CORE_SIGNALS and (event[0] == 'key' or name != 'QUIT')
-            yield Case(f'pretrap/{mode}/{event_id(event)}', 'PRE-1', mode=mode, shims={'scutil': 'slow'},
+            # scutil never finishes by itself here: if serve does not end it,
+            # PROC-1 sees it left behind, however long the case waits
+            yield Case(f'pretrap/{mode}/{event_id(event)}', 'PRE-1', mode=mode, shims={'scutil': 'hangs'},
                        phase='pretrap', event=event, ends='itself',
-                       exit=128 + signum(name) if observable(event) else None, window=(0, 1.0),
+                       exit=128 + signum(name) if observable(event) else None, window=QUICK,
                        printed=False, nothing_started=True, crashes=crashes)
 
 
@@ -213,8 +221,7 @@ def running_cases():
                 lo, hi = WINDOW[b]
                 yield Case(f'running/{mode}/{b}/kill-parent ({"nested shell" if nested else "session leader"})',
                            ('STOP-3', CLEAN[b]), mode=mode, behaviour=b, nested=nested, phase='running',
-                           event=('kill-parent',), ends='itself', exit=None,
-                           window=(lo, hi + (NESTED_EXTRA if nested else 0)))
+                           event=('kill-parent',), ends='itself', exit=None, window=(lo, hi))
             services = ('caddy', 'cloudflared') if mode == 'share' else ('caddy',)
             for svc in services:
                 # the stubborn one is cloudflared: kill it and nothing is left to wait for
@@ -223,11 +230,11 @@ def running_cases():
                            phase='running', event=('kill', svc), ends='itself',
                            exit=137 if left == 'stubborn' else 1, window=WINDOW[left],
                            messages=(f'serve: {svc} exited',))
-        # the parent check: not during startup; noticed once startup is done
+        # STOP-4: a parent gone during startup is a stop event like any other
         yield Case(f'startup/{mode}/kill-parent (nested shell) while waiting for the port',
                    'STOP-4', mode=mode, shims={'caddy': 'slow'}, nested=True,
                    phase='startup', event=('kill-parent',), ends='itself', exit=None,
-                   window=(1.0, 4.0), printed=True)
+                   window=WINDOW['idle'], printed=False, cf=False)
 
 
 def other_signal_cases():
@@ -262,15 +269,15 @@ def pipe_cases():
         yield Case(f'output/{mode}/| head -2 (reader leaves, nothing more is written)', 'PIPE-1', mode=mode,
                    pipe=' | head -2', phase='none', ends='continues', then='ctrl-c', exit=0, stdout_tty=False)
         yield Case(f'output/{mode}/| true (serve writes first)', 'PIPE-2', mode=mode, pipe=' | true',
-                   phase='none', ends='itself', exit=0, window=(0, 3), messages=('write error: broken pipe',))
+                   phase='none', ends='itself', exit=0, window=PIPE_BOTH, messages=('write error: broken pipe',))
         yield Case(f'output/{mode}/|& true (whoever writes first)', 'PIPE-3', mode=mode, pipe=' |& true',
-                   phase='none', ends='itself', exit=(0, 1), window=(0, 3))
-        yield Case(f'output/{mode}/|& tee (pipeline peer in the group)', ('PROC-4', 'OUT-2', 'STOP-1', 'CLEAN-1'), mode=mode, pipe=' |& tee {tee}',
+                   phase='none', ends='itself', exit=(0, 1), window=PIPE_BOTH)
+        yield Case(f'output/{mode}/|& tee (pipeline peer in the group)', ('OUT-2', 'STOP-1', 'CLEAN-1'), mode=mode, pipe=' |& tee {tee}',
                    phase='running', event=('signal', 'TERM'), ends='itself', exit=0, stdout_tty=False, tee=True)
     # a service hits the dead pipe first: the stub logs again a second in, after
     # serve's own output has gone to the terminal
     yield Case('output/share/2>&1 >/dev/tty | head -1 (a service writes first)', 'PIPE-4', mode='share',
-               pipe=' 2>&1 >/dev/tty | head -1', phase='none', ends='itself', exit=1, window=(0, 4))
+               pipe=' 2>&1 >/dev/tty | head -1', phase='none', ends='itself', exit=1, window=PIPE_SERVICE)
 
 
 # -------------------------------------------------------------------- cleanup
@@ -291,7 +298,7 @@ def limitation_cases():
             shims = {'caddy': 'slow'} if phase == 'startup' else {}
             for s in FATAL_SIGNALS:
                 yield Case(f'{phase}/{mode}/signal:{s} skips cleanup', (), mode=mode, shims=shims,
-                           phase=phase, event=('signal', s), ends='leaks', exit=128 + signum(s), window=(0, 1.0),
+                           phase=phase, event=('signal', s), ends='leaks', exit=128 + signum(s), window=QUICK,
                            crashes=s in CORE_SIGNALS)
         yield Case(f'startup/{mode}/lsof hangs', 'LIM-1', mode=mode, shims={'lsof': 'hangs'},
                    phase='none', ends='continues', then='ctrl-c', hold=12, exit=0, printed=False)
@@ -300,7 +307,7 @@ def limitation_cases():
                    nothing_started=True)
     yield Case('cleanup/share/stubborn/signal:KILL during cleanup skips the rest', 'LIM-3', mode='share',
                behaviour='stubborn', phase='cleanup', event=('key', '^C'), second=('signal', 'KILL'),
-               ends='leaks', exit=137, window=(0, 1.0))
+               ends='leaks', exit=137, window=QUICK)
 
 
 # ------------------------------------------------------------ usage and output

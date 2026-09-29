@@ -14,12 +14,17 @@ records make that hold:
   short-lived can slip between two samples.
 
 * serve's PATH holds nothing but ledger shims. caddy, cloudflared, lsof and
-  scutil each write down who they are (PID, parent, process group, start
-  time, arguments) and only then exec the real program under the same PID.
-  So everything serve runs is on record before it can do anything, even if
-  it later leaves the session, and a PID only counts as the recorded process
-  while its start time still matches: PID reuse can fake neither a leak nor
-  a clean exit.
+  scutil each write down who they are (PID, parent, arguments) and only then
+  exec the real program under the same PID, so everything serve runs is on
+  record before it can do anything. A shim uses nothing but shell builtins:
+  serve runs lsof ten times a second while it waits for a port, and a shim
+  that ran ps (as an earlier one did) made serve itself slow whenever ps
+  stalled, which is the fixture disturbing what it measures. The start time
+  that pins a PID to the recorded process is therefore taken by the fixture,
+  the first time it sees the process alive in its session; from then on a
+  PID only counts while that start time still matches, so PID reuse can fake
+  neither a leak nor a clean exit. A process never seen alive (a helper that
+  finished within milliseconds) counts only while it is in the session.
 
 Terminals must be read continuously. A terminal nobody reads fills up, and
 then whatever writes to it blocks: a service mid-log, serve mid-print, or a
@@ -108,6 +113,21 @@ def session_members(sid, table=None):
 
 OPEN_TERMINALS = []
 
+# The longest this process went between two turns of any wait loop: those
+# turns come every 20-100 ms, so a much longer gap means the whole machine
+# stalled, and a timing measured across it says little about serve.
+MAX_GAP = [0.0]
+
+
+def register_session(sid):
+    """Note a session this run created, the moment it exists, in the file
+    named by NA_SESSIONS_FILE: whoever cleans up after the run (even one cut
+    short, with cases still in flight) can then find everything in it."""
+    path = os.environ.get('NA_SESSIONS_FILE')
+    if path:
+        with open(path, 'a') as f:
+            f.write(f'{sid}\n')
+
 
 def pump_all():
     for t in list(OPEN_TERMINALS):
@@ -118,13 +138,17 @@ def wait_until(predicate, timeout, interval=0.05):
     """Poll until `predicate` holds or `timeout` passes, reading every open
     terminal meanwhile. Returns whether it held."""
     deadline = time.time() + timeout
+    last = time.time()
     while True:
         pump_all()
         if predicate():
             return True
-        if time.time() >= deadline:
+        now = time.time()
+        MAX_GAP[0] = max(MAX_GAP[0], now - last)
+        if now >= deadline:
             return False
         time.sleep(interval)
+        last = time.time()
 
 
 def sleep(seconds):
@@ -134,18 +158,24 @@ def sleep(seconds):
 
 # --------------------------------------------------------------------- ledger
 
-Entry = collections.namedtuple('Entry', 'name pid ppid pgid lstart args')
+Entry = collections.namedtuple('Entry', 'name pid ppid args')
 
 SHIM = """#!/bin/sh
 # Ledger shim: record who this process is, then become {name} (same PID).
-printf '%s\\t%s\\t%s\\t%s\\t%s\\n' {name} $$ $PPID "$(/bin/ps -o pgid=,lstart= -p $$)" "$*" >> {ledger}
+# Builtins only: nothing here may slow serve down.
+printf '%s\\t%s\\t%s\\t%s\\n' {name} $$ $PPID "$*" >> {ledger}
 {action}
 """
 
 
 class Ledger:
-    def __init__(self, path):
+    """The shims' record. `sids` are the sessions this ledger's processes
+    belong to (the case's); it may grow as the case opens more."""
+
+    def __init__(self, path, sids):
         self.path = path
+        self.sids = sids
+        self.seen = {}        # PID -> start time, from the first sighting
 
     def entries(self, name=None):
         if not os.path.exists(self.path):
@@ -153,27 +183,46 @@ class Ledger:
         out = []
         with open(self.path) as f:
             for line in f:
-                parts = line.rstrip('\n').split('\t')
-                if len(parts) != 5 or len(parts[3].split()) < 6:
+                if not line.endswith('\n'):
                     continue      # a line still being written
-                name_, pid, ppid, pl, args = parts
-                pl = pl.split()
-                out.append(Entry(name_, int(pid), int(ppid), int(pl[0]), ' '.join(pl[1:6]), args))
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) != 4:
+                    continue
+                out.append(Entry(parts[0], int(parts[1]), int(parts[2]), parts[3]))
         return [e for e in out if name is None or e.name == name]
 
     def first(self, name):
         e = self.entries(name)
         return e[0] if e else None
 
+    def running(self, entry, table=None):
+        """Whether the recorded process itself (not a reused PID) is alive."""
+        table = proc_table() if table is None else table
+        p = table.get(entry.pid)
+        if p is None:
+            return False
+        if entry.pid in self.seen:
+            return p.lstart == self.seen[entry.pid]
+        if session_of(entry.pid) in self.sids:
+            self.seen[entry.pid] = p.lstart
+            return True
+        return False
 
-def running(entry, table=None):
-    """Whether the recorded process itself (not a reused PID) is still alive."""
-    table = proc_table() if table is None else table
-    p = table.get(entry.pid)
-    return p is not None and p.lstart == entry.lstart
+    def still_running(self, table=None):
+        table = proc_table() if table is None else table
+        return [e for e in self.entries() if self.running(e, table)]
 
 
 # ------------------------------------------------------------ helper stand-ins
+
+# How long a stand-in that "hangs" actually runs. Long enough to outlast every
+# time bound in the plan, so a serve that fails to end it leaves it behind and
+# fails the case; short enough that nothing waits on it forever, and nothing
+# outlives a crashed run for long.
+STALL = 30
+# How long the cloudflared stand-in lives: far longer than any case.
+STUB_LIFETIME = 300
+
 
 def exec_real(path):
     return f'exec {q(path)} "$@"'
@@ -184,7 +233,7 @@ CADDY = {
     # A deterministic startup window: caddy launched, not yet listening
     'slow': lambda: f'/bin/sleep 2\n{exec_real(REAL_CADDY)}',
     'exits': lambda: 'exit 1',
-    'never-listens': lambda: 'exec /bin/sleep 3600',
+    'never-listens': lambda: f'exec /bin/sleep {STALL}',
 }
 
 LSOF = {
@@ -195,7 +244,7 @@ LSOF = {
     'way-too-big': lambda: 'echo "n*:99999999999999999999999"',
     'says-nothing': lambda: 'exit 0',
     'fails': lambda: 'echo "lsof: broken" >&2; exit 1',
-    'hangs': lambda: 'exec /bin/sleep 3600',
+    'hangs': lambda: f'exec /bin/sleep {STALL}',
 }
 
 SCUTIL = {
@@ -204,7 +253,7 @@ SCUTIL = {
     # A deterministic window before serve traps anything; it finishes by
     # itself, so whatever serve does meanwhile, it leaves nothing hanging
     'slow': lambda: f'/bin/sleep 2\n{exec_real(REAL_SCUTIL)}',
-    'hangs': lambda: 'exec /bin/sleep 3600',
+    'hangs': lambda: f'exec /bin/sleep {STALL}',
 }
 
 # A stand-in for cloudflared that reproduces what serve's lifecycle depends
@@ -230,6 +279,7 @@ SCUTIL = {
 CLOUDFLARED_STUB = """#!{python}
 import os, signal, sys, time
 MODE = {mode!r}
+LIFETIME = {lifetime!r}
 signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 def log(msg):
@@ -260,13 +310,12 @@ log('INF Requesting new quick Tunnel on trycloudflare.com...')
 log('INF |  https://stub-%d.trycloudflare.com  |' % os.getpid())
 time.sleep(1)
 log('INF Registered tunnel connection connIndex=0')
-while True:
-    time.sleep(3600)
+time.sleep(LIFETIME)
 """
 
 
 def write_shims(directory, ledger, caddy='real', lsof='real', scutil='real',
-                cloudflared='idle', missing=()):
+                cloudflared='idle', missing=(), lifetime=STUB_LIFETIME):
     """One shim per helper in `directory`. `cloudflared` is a stub mode
     ('idle', 'draining', 'stubborn') or 'real'; names in `missing` get no
     shim, so serve cannot find them."""
@@ -277,7 +326,7 @@ def write_shims(directory, ledger, caddy='real', lsof='real', scutil='real',
     else:
         stub = os.path.join(directory, '.cloudflared-stub')
         with open(stub, 'w') as f:
-            f.write(CLOUDFLARED_STUB.format(python=PYTHON, mode=cloudflared))
+            f.write(CLOUDFLARED_STUB.format(python=PYTHON, mode=cloudflared, lifetime=lifetime))
         os.chmod(stub, 0o755)
         actions['cloudflared'] = exec_real(stub)
     for name, action in actions.items():
@@ -302,6 +351,7 @@ class Terminal:
             env['TERM'] = 'dumb'
             os.execve('/bin/zsh', ['zsh', '-f', '-i'], env)
         self.pid = self.sid = pid
+        register_session(self.sid)
         self.fd = fd
         os.set_blocking(fd, False)
         self.raw = b''
