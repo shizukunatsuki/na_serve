@@ -110,35 +110,57 @@ fi
 # one would only loop; like SIGKILL, they are beyond what a script can catch.
 trap 'stop=1' $stop_signals
 
-# Services an earlier serve left behind when it was killed outright (see the
-# README's known limitations) keep running, the directory still exposed, and
-# nothing else would ever mention them. They look like what serve starts, with
-# a parent that is gone (launchd has adopted them), and are pointed out here
-# before anything starts, never touched: telling them apart from someone
-# else's processes is a guess, and killing on a guess is not serve's call.
-# Another serve that is still running is no match, its services' parent being
-# that serve.
-typeset -a strays pgids
-typeset -a f
-typeset cmdline
-for line in ${(f)"$(ps -A -ww -o pid=,ppid=,pgid=,command= 2>/dev/null)"}; do
+# Services an earlier serve left behind (see the README's known limitations:
+# killed outright, or stuck on a hung lsof after its shell went away) keep
+# running, the directory still exposed, and nothing else would ever mention
+# them. This check is the only safety net for that, so it errs on the side of
+# saying too much: every caddy and cloudflared is listed, whatever its
+# arguments (an older serve may have used others), unless its parent is a
+# serve that is still running normally, that is, one whose own parent is not
+# launchd. A serve that launchd has adopted is listed as well: it has lost
+# its shell without noticing, so it is stuck. Nothing listed is touched:
+# telling a leftover from someone's own process is the user's call, and
+# killing on a guess is not serve's. Command lines are written with control
+# characters replaced, so no process can put escape sequences on the
+# terminal through them. If ps fails, saying nothing would read as "no
+# leftovers", so that is said instead.
+typeset -a strays pgids f
+typeset cmdline out pid pp
+typeset -A ppid_of pgid_of cmd_of
+# zsh running a script called serve, as `serve` itself shows up in ps
+is_serve() { [[ $1 == (*/|)zsh' -f '(*/|)serve(|' '*) ]] }
+out=$(ps -A -ww -o pid=,ppid=,pgid=,command= 2>/dev/null)
+if (( $? )) || [[ -z $out ]]; then
+  print -u2 "serve: could not check for services left behind (ps failed)"
+fi
+for line in ${(f)out}; do
   f=(${=line})
-  (( $#f >= 4 && f[2] == 1 )) || continue
-  cmdline=${f[4,-1]}
-  [[ $cmdline == (*/|)'caddy file-server --browse --listen :0' ||
-     $cmdline == (*/|)'cloudflared tunnel --url http://localhost:'<-> ]] || continue
-  strays+=("    PID $f[1]  PGID $f[3]  $cmdline")
-  (( ${pgids[(Ie)$f[3]]} )) || pgids+=($f[3])
+  (( $#f >= 4 )) || continue
+  ppid_of[$f[1]]=$f[2] pgid_of[$f[1]]=$f[3] cmd_of[$f[1]]=${f[4,-1]}
+done
+for pid in ${(kon)cmd_of}; do
+  (( pid == $$ )) && continue
+  cmdline=$cmd_of[$pid]
+  f=(${=cmdline})
+  if [[ ${f[1]:t} == (caddy|cloudflared) || ${f[2]:t} == (caddy|cloudflared) ]]; then
+    pp=$ppid_of[$pid]
+    is_serve "$cmd_of[$pp]" && (( ppid_of[$pp] != 1 )) && continue
+  elif ! { is_serve "$cmdline" && (( ppid_of[$pid] == 1 )) }; then
+    continue
+  fi
+  strays+=("    PID $pid  PGID $pgid_of[$pid]  ${cmdline//[^[:print:]]/?}")
+  (( ${pgids[(Ie)$pgid_of[$pid]]} )) || pgids+=($pgid_of[$pid])
 done
 if (( $#strays )); then
   typeset warn= off=
   [[ -t 2 ]] && { warn=$'\e[33m'; off=$'\e[0m' }
   print -ru2 -- "
 ${warn}── serve: warning ─────────────────────────────${off}
-  These look like services left behind by an earlier serve
-  (their parent is gone), and may still expose a directory:
+  These caddy/cloudflared processes do not belong to a serve that is
+  still running normally. Unless you started them yourself, they may
+  be left behind by an earlier serve and still expose a directory:
 ${(F)strays}
-  If they are, end them with: ${(j:, :)${(@)pgids/#/kill -KILL -}}
+  To end them: ${(j:, :)${(@)pgids/#/kill -KILL -}}
 ${warn}───────────────────────────────────────────────${off}"
 fi
 

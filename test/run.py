@@ -62,8 +62,13 @@ def plan_coverage():
 MARGIN = 0.5
 # PLAN.md section 5: a timing failure fails the case, but the machine itself
 # stalls now and then, so it may not be serve's fault
-STALL_NOTE = ('  [a whole-machine stall can also cause this: a longest fixture gap well over 0.1s '
-              'points that way; see PLAN.md section 5]')
+STALL_NOTE = ('  [a timing failure: high system load or a whole-machine stall can cause it too (a longest '
+              'fixture gap well over 0.1s points that way; load averages are printed at the end). Rerun the '
+              'case alone before concluding anything; PLAN.md section 5]')
+# PLAN.md section 5, for a failed case in which a wait ran out of time
+WAIT_NOTE = ('note: {n} wait(s) in this case ran out of time (longest fixture gap {gap:.2f}s), so these '
+             'failures may come from high system load rather than from serve. Rerun the case alone before '
+             'concluding anything; PLAN.md section 5')
 # How long "nothing left behind" (PROC-1, PROC-2) may take once serve is gone
 LEFTOVER_WAIT = spec.LEFTOVER + MARGIN
 # ... and when serve has only just been told to stop (CLEAN-1 first)
@@ -168,7 +173,10 @@ class World:
               'print "END=$EPOCHREALTIME EXIT=${pipestatus[1]}:${pipestatus[2]}"')
 
     def end_report(self, t, timeout=0.0, since=None):
-        m = t.expect(r'END=([\d.]+) EXIT=(\d+):(\d*)', timeout, self.mark if since is None else since)
+        # quiet: a job killed by SIGINT never gets to report, which is no sign
+        # of the machine being slow (the callers fall back on other means)
+        m = t.expect(r'END=([\d.]+) EXIT=(\d+):(\d*)', timeout, self.mark if since is None else since,
+                     quiet=True)
         return (float(m.group(1)), int(m.group(2)), m.group(3)) if m else None
 
     def query_exit(self, t, timeout=10, since=None):
@@ -183,7 +191,7 @@ class World:
         m = t.expect(r'STATUS=(\d+):(\d*)', timeout, mark)
         return (int(m.group(1)), m.group(2)) if m else None
 
-    def serve_identity(self, timeout=5):
+    def serve_identity(self, timeout=5, quiet=False):
         """serve's PID and start time. serve is the child of the shell it was
         started from that leads a process group of its own: the interactive
         shell puts each job in a group led by its first process, and the only
@@ -208,7 +216,7 @@ class World:
                                    if p.ppid == t.shell and p.pgid == leaders[0].pid and p.pid != leaders[0].pid})
                 return True
             return False
-        fx.wait_until(look, timeout)
+        fx.wait_until(look, timeout, quiet=quiet)
         self.serve = found[0] if found else None
         return self.serve
 
@@ -458,7 +466,7 @@ def run_lifecycle(w):
             t_ref = w.stub_note(e['since'], 10) or w.t0
         gone, dt, source = True, None, None
         w.timeline = []
-        if w.serve or w.serve_identity(timeout=0.5):
+        if w.serve or w.serve_identity(timeout=0.5, quiet=True):     # it may be gone already
             gone = w.wait_serve_gone(hi + MARGIN + 1)
             dt, source = time.time() - t_ref, 'polled'
             w.check(gone, 'serve ends by itself')
@@ -832,11 +840,8 @@ def run_streams(w):
     w.check(w.wait_clean(STOP_AND_LEFTOVER_WAIT) or w.describe(w.leftovers()), 'nothing left behind')
 
 
-def fake_orphan(w, name, args, orphan=True):
-    """A process whose command line reads `<path>/name args`, in a session of
-    its own. With `orphan`, the shell that started it exits at once, so launchd
-    adopts it (parent PID 1); without, the shell stays and waits for it.
-    Returns (pid, pgid). It runs a finite STALL seconds either way."""
+def fake_script(w, name):
+    """`<case dir>/fake/name`, a script that runs a finite STALL seconds."""
     d = os.path.join(w.dir, 'fake')
     os.makedirs(d, exist_ok=True)
     path = os.path.join(d, name)
@@ -844,6 +849,15 @@ def fake_orphan(w, name, args, orphan=True):
         with open(path, 'w') as f:
             f.write(f'#!/bin/sh\n/bin/sleep {fx.STALL}\n')
         os.chmod(path, 0o755)
+    return path
+
+
+def fake_orphan(w, name, args, orphan=True):
+    """A process whose command line reads `<path>/name args`, in a session of
+    its own. With `orphan`, the shell that started it exits at once, so launchd
+    adopts it (parent PID 1); without, the shell stays and waits for it.
+    Returns (pid, pgid). It runs a finite STALL seconds either way."""
+    path = fake_script(w, name)
     line = f'{fx.q(path)} {args} & echo $!' + ('' if orphan else '; wait')
     p = subprocess.Popen(['/bin/sh', '-c', line], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL, start_new_session=True)
@@ -856,13 +870,38 @@ def fake_orphan(w, name, args, orphan=True):
     return pid, p.pid
 
 
+def fake_serve(w):
+    """An orphaned process that looks like serve (`zsh -f <path>/serve`), as
+    one stuck on a hung lsof would be once its shell is gone, with a caddy of
+    its own. Returns ((pid, pgid), (caddy pid, pgid))."""
+    caddy = fake_script(w, 'caddy')
+    path = os.path.join(os.path.dirname(caddy), 'serve')
+    with open(path, 'w') as f:
+        f.write(f'#!/bin/zsh -f\n{fx.q(caddy)} file-server --browse --listen :0 &\nprint CADDY=$!\nwait\n')
+    os.chmod(path, 0o755)
+    p = subprocess.Popen(['/bin/sh', '-c', f'/bin/zsh -f {fx.q(path)} & echo SERVE=$!'], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    fx.register_session(p.pid)
+    w.fake_sids.append(p.pid)
+    got = {}
+    while len(got) < 2:
+        k, v = p.stdout.readline().decode().strip().split('=')
+        got[k] = int(v)
+    p.wait()
+    fx.wait_until(lambda: (fx.proc_table().get(got['SERVE']) or fx.Proc(0, 0, 0, '', '', '')).ppid == 1, 3)
+    return (got['SERVE'], p.pid), (got['CADDY'], p.pid)
+
+
 def run_warn(w):
     """WARN-1, WARN-2: with fakes the fixture made (and a serve that is still
     running), what the warning lists and what it leaves alone."""
     listed_ok = [fake_orphan(w, 'caddy', 'file-server --browse --listen :0'),
-                 fake_orphan(w, 'cloudflared', 'tunnel --url http://localhost:12345')]
-    unlisted = [fake_orphan(w, 'caddy', 'file-server --listen :0'),
-                fake_orphan(w, 'caddy', 'file-server --browse --listen :0', orphan=False)]
+                 fake_orphan(w, 'cloudflared', 'tunnel --url http://localhost:12345'),
+                 # other arguments (as an older serve might have used)
+                 fake_orphan(w, 'caddy', 'file-server --listen :8080'),
+                 # a parent that is still there, but is not serve
+                 fake_orphan(w, 'caddy', 'file-server --browse --listen :0', orphan=False),
+                 *fake_serve(w)]
     w.terms = [w.open_terminal(), w.open_terminal()]
     other, t = w.terms
     other.mark0 = other.mark()
@@ -879,26 +918,43 @@ def run_warn(w):
     shown = {int(pid): int(pgid) for pid, pgid in re.findall(r'PID (\d+)\s+PGID (\d+)', body)}
     for pid, pgid in listed_ok:
         w.check(shown.get(pid) == pgid or f'PID {pid} PGID {pgid} not in: {body[:300]}', 'a leftover is listed with its group')
-        w.check(f'kill -KILL -{pgid}' in body, f'the remedy for group {pgid} is given')
-    for pid, _ in unlisted:
-        w.check(pid not in shown, f'PID {pid} (not a leftover) is not listed')
+        w.check(re.search(rf'kill -KILL -{pgid}\b', body) is not None, f'the remedy for group {pgid} is given')
     for pid in theirs:
         w.check(pid not in shown, f'the running serve\'s service {pid} is not listed')
     for tt in w.terms:
         tt.send(KEYS['^C'])
     w.check(w.wait_clean(STOP_AND_LEFTOVER_WAIT) or w.describe(w.leftovers()), 'nothing left behind')
     table = fx.proc_table()
-    w.check(all(pid in table for pid, _ in listed_ok + unlisted), 'serve touched none of them')
+    w.check(all(pid in table for pid, _ in listed_ok), 'serve touched none of them')
+
+
+NO_SCAN = 'serve: could not check for services left behind (ps failed)'
+
+
+def run_no_scan(w):
+    """WARN-3: when ps fails, serve says the check could not run, then starts.
+    And WARN-1's control characters, with a ps that reports them raw."""
+    t = w.term = w.open_terminal()
+    w.launch(t)
+    w.check(bool(t.expect(r'Local:\s+http://', STARTUP_WAIT, w.mark)), 'serve starts all the same')
+    if w.case.shims['ps'] == 'raw-control':
+        w.check(re.search(rf'PID {fx.FAKE_PID}\s+PGID {fx.FAKE_PID}\s', t.text(w.mark)) is not None,
+                'the made-up leftover is listed')
+        w.check(b'\x1b]0;owned' not in t.raw[w.mark:], 'control characters in a command line are not written as they are')
+    else:
+        w.check(NO_SCAN in t.text(w.mark), f'message "{NO_SCAN}"')
+    stop_with_ctrl_c(w, t, 0)
 
 
 RUNNERS = {'lifecycle': run_lifecycle, 'args': run_args, 'leader': run_leader,
            'concurrency': run_concurrency, 'streams': run_streams, 'warn': run_warn,
-           'public': run_public}
+           'public': run_public, 'no-scan': run_no_scan}
 
 
 def run_case(case, root, big):
     w = World(case, root, big)
     fx.MAX_GAP[0] = 0.0
+    fx.WAITS_RUN_OUT.clear()
     t0 = time.time()
     try:
         RUNNERS[case.kind](w)
@@ -914,7 +970,13 @@ def run_case(case, root, big):
             pass
         w.teardown()
     w.measured['max_gap'] = round(fx.MAX_GAP[0], 3)
+    w.measured['waits_run_out'] = list(fx.WAITS_RUN_OUT)
+    timing = any(STALL_NOTE in f for f in w.failures)
+    waited_out = bool(fx.WAITS_RUN_OUT) and bool(w.failures)
+    if waited_out and not timing:
+        w.failures.append(WAIT_NOTE.format(n=len(fx.WAITS_RUN_OUT), gap=fx.MAX_GAP[0]))
     return {'id': case.id, 'plan': case.plan, 'failures': w.failures, 'measured': w.measured,
+            'maybe_load': timing or waited_out,
             'behaviour': case.behaviour, 'phase': case.phase,
             'seconds': round(time.time() - t0, 1), 'sids': w.sids}
 
@@ -1006,6 +1068,7 @@ def main():
         f.write(os.urandom(64 << 20))
     results, bystander_ok, bystander = [], True, None
     started = time.time()
+    load_at_start = os.getloadavg()
     try:
         bystander = Bystander(root, big)
         ctx = multiprocessing.get_context('spawn')
@@ -1032,7 +1095,8 @@ def main():
                         r['failures'].append('bystander serve disturbed')
                     results.append(r)
                     mark = 'FAIL' if r['failures'] else 'ok  '
-                    print(f'[{len(results):3}/{len(cases)}] {mark} {r["id"]}  ({r["seconds"]}s)', flush=True)
+                    print(f'[{len(results):3}/{len(cases)}] {mark} {r["id"]}  ({r["seconds"]}s)'
+                          + ('  (may be load)' if r['failures'] and r['maybe_load'] else ''), flush=True)
                     for f in r['failures']:
                         print(f'             - {f}', flush=True)
         bystander_ok = bystander.stop() and bystander_ok
@@ -1074,13 +1138,19 @@ def main():
         print(f'fixture leftovers swept after the run: {len(stray)} ('
               + ', '.join(c[:40] for c in stray.values()) + ')')
     for r in sorted(failed, key=lambda r: r['id']):
-        print(f'FAIL {r["id"]}  [{" ".join(r["plan"])}]')
+        print(f'FAIL {r["id"]}  [{" ".join(r["plan"])}]' + ('  (may be load)' if r['maybe_load'] else ''))
         for f in r['failures']:
             print(f'     - {f}')
-    if any('in time' in f for r in failed for f in r['failures']):
-        print('\nnote: some failures are timing failures. They count as failures, but a whole-machine stall '
-              'can cause them too, so they do not by themselves prove serve wrong: check each one\'s longest '
-              'fixture gap, and rerun that case alone if in doubt (PLAN.md section 5).')
+    load = [r for r in failed if r['maybe_load']]
+    if load:
+        print(f'\nnote: {len(load)} of the {len(failed)} failed cases are marked "(may be load)": they ran into a '
+              f'time limit, or a wait in them ran out of time. They count as failures, but high system load or a '
+              f'whole-machine stall causes those too, so on their own they do not show serve, the test plan or '
+              f'the fixture to be wrong. Load averages (1/5/15 min): '
+              f'{" ".join(f"{x:.1f}" for x in load_at_start)} at the start, '
+              f'{" ".join(f"{x:.1f}" for x in os.getloadavg())} at the end. Before changing anything because of '
+              f'one, rerun it alone (-k) on a quiet machine: only a failure that comes back there, with a small '
+              f'longest fixture gap, is worth acting on (PLAN.md section 5).')
     sys.exit(0 if not failed and bystander_ok and not stray else 1)
 
 

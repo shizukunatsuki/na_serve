@@ -63,17 +63,21 @@ serve --help     # 打印用法
 
 stderr 上还有另外几类输出：
 
-- **疑似残留的警告**：启动服务之前，如果发现疑似以前的 `serve` 留下的服务（见启动第 4
-  步），会打印一个黄色边框的警告块，列出它们和清理命令：
+- **疑似残留的警告**：启动服务之前，如果发现可能是以前的 `serve` 留下的进程（见启动
+  第 4 步），会打印一个黄色边框的警告块，列出它们和清理命令：
 
   ```
   ── serve: warning ─────────────────────────────
-    These look like services left behind by an earlier serve
-    (their parent is gone), and may still expose a directory:
-      PID 4569  PGID 4565  caddy file-server --browse --listen :0
-    If they are, end them with: kill -KILL -4565
+    These caddy/cloudflared processes do not belong to a serve that is
+    still running normally. Unless you started them yourself, they may
+    be left behind by an earlier serve and still expose a directory:
+      PID 4569  PGID 4565  /opt/homebrew/bin/caddy file-server --browse --listen :0
+    To end them: kill -KILL -4565
   ───────────────────────────────────────────────
   ```
+
+  如果检查本身做不了（`ps` 失败），会打印
+  `serve: could not check for services left behind (ps failed)`，而不是当作没有残留。
 - **Caddy 和 cloudflared 的日志**：原样输出，所以终端里能看到 Caddy 启动和关闭的几行
   日志。
 - **公网隧道地址**：`--share` 时，隧道地址也会出现在 cloudflared 自己的日志里，形如
@@ -113,11 +117,16 @@ stderr 上还有另外几类输出：
    - 例外：如果脚本进程本身是组长，并且用 `exec` 把自己换成 `serve`（`zsh -c` 的
      最后一条命令会自动这样做），`serve` 就继承了组长身份，可以正常运行。这时通常
      没有终端，只能靠信号或父进程退出来停止。
-4. **提示疑似残留**：用 `ps` 找出命令行和 `serve` 启动服务时一样（`caddy file-server
-   --browse --listen :0` 或 `cloudflared tunnel --url http://localhost:<端口>`）、并且
-   父进程已经是 launchd（原来的 `serve` 已经不在了）的进程。找到的话就打印警告，然后
-   照常启动。`serve` 只提示，从不结束它们：是不是真的残留，由你判断。另一个仍在运行
-   的 `serve` 的服务不会被列出，因为它们的父进程还在。
+4. **提示疑似残留**：这是已知限制（见[已知限制](#已知限制)）留下的进程唯一的兜底，所以
+   宁可误报，不可漏报。用 `ps` 列出：
+   - **所有 caddy 和 cloudflared 进程**，不管参数是什么（旧版 `serve` 可能用过别的参数），
+     也不管父进程是谁；只排除父进程是一个正常运行中的 `serve` 的那些，也就是那个
+     `serve` 的父进程还不是 launchd。所以你自己启动的 caddy、cloudflared 也会被列出。
+   - **父进程已经是 launchd 的 `serve` 本身**：它的 shell 已经不在了，自己却没发现，说明
+     卡住了（例如卡在 `lsof` 上），它的服务还在暴露目录。
+
+   找到的话就打印警告，然后照常启动。`serve` 只提示，从不结束它们：是不是真的残留，
+   由你判断。命令行里的控制字符会被替换掉再打印。`ps` 失败时明确说检查没做成。
 5. **启动 Caddy**：发布当前目录，开启目录列表，监听所有网络接口，端口由内核分配
    一个空闲端口。
 6. **读回端口**：用 `lsof` 读回 Caddy 实际监听的端口，最多等 10 秒。
@@ -256,7 +265,7 @@ stderr 上还有另外几类输出：
 - **收尾被跳过的情况**：`serve` 被 `SIGKILL`（如 `kill -9`、活动监视器里的"强制退出"），
   或者收到 `SEGV`、`BUS`、`ILL`、`FPE`、`TRAP` 这类致命信号时，不会执行收尾，Caddy
   和 cloudflared 会继续运行。下次运行 `serve` 时，启动前会用警告块把它们指出来
-  （启动第 4 步）。
+  （启动第 4 步），警告里也给出了清理命令。
   - 后面这几个信号不捕获，是因为它们真正发生时，处理函数返回后会重新执行出错的
     那条指令，捕获了只会卡死。
   - 残留进程仍在原来的进程组里，可以按组一次结束。组 ID 就是当时 `serve` 的 PID。
@@ -264,14 +273,15 @@ stderr 上还有另外几类输出：
     一直等下去：
 
     ```bash
-    pgrep -lf 'caddy file-server|cloudflared tunnel --url'   # 找残留进程
+    pgrep -lf 'caddy|cloudflared'                               # 找残留进程
     ps -o pgid= -p <PID>                                        # 查它的进程组
     kill -KILL -<PGID>                                          # 按组结束
     ```
 - **`lsof` 卡死时，10 秒上限不起作用**：截止时间只在两次 `lsof` 调用之间检查，单次
   调用卡死时 `serve` 会一直等。可以按 `Ctrl-C` 停止，收尾照常执行。`--share` 时读
   公网地址也用 `lsof`：它卡死时，服务照常运行，但输出块不会出现，连局域网地址也
-  看不到；同样可以按 `Ctrl-C` 停止。
+  看不到；同样可以按 `Ctrl-C` 停止。卡住期间如果启动它的 shell 没了，`serve` 不会
+  发现，它和它的服务会一直留着；下次运行 `serve` 时会被警告块指出来。
 - **`scutil` 卡死时，`serve` 停在启动之前**：可以按 `Ctrl-C` 退出，这时还什么都没有
   启动。
 - **必须是进程组组长才能运行**：所以不能在管道的非首位使用，也不能被没开 job

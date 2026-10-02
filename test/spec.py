@@ -352,6 +352,11 @@ def warning_cases():
     for mode in MODES:
         yield Case(f'warn/{mode}/leftovers are pointed out, nothing else is', ('WARN-1', 'WARN-2'),
                    kind='warn', mode=mode)
+        for ps in ('fails', 'says-nothing'):
+            yield Case(f'warn/{mode}/ps {ps}: serve says it could not check', 'WARN-3', kind='no-scan',
+                       mode=mode, shims={'ps': ps})
+    yield Case('warn/lan/ps reports raw control characters: none reach the terminal', 'WARN-1', kind='no-scan',
+               shims={'ps': 'raw-control'})
 
 
 def usage_cases():

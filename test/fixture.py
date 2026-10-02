@@ -139,6 +139,12 @@ OPEN_TERMINALS = []
 # stalled, and a timing measured across it says little about serve.
 MAX_GAP = [0.0]
 
+# Waits that ran out of time before what they waited for happened, as their
+# time limits: a case that fails after one of these may have failed because
+# the machine was too busy, not because of serve. Waits that are expected to
+# run out (a plain pause, a look that is allowed to find nothing) say quiet.
+WAITS_RUN_OUT = []
+
 
 def register_session(sid):
     """Note a session this run created, the moment it exists, in the file
@@ -155,9 +161,10 @@ def pump_all():
         t.pump()
 
 
-def wait_until(predicate, timeout, interval=0.05):
+def wait_until(predicate, timeout, interval=0.05, quiet=False):
     """Poll until `predicate` holds or `timeout` passes, reading every open
-    terminal meanwhile. Returns whether it held."""
+    terminal meanwhile. Returns whether it held; unless `quiet`, running out
+    of time is noted in WAITS_RUN_OUT."""
     deadline = time.time() + timeout
     last = time.time()
     while True:
@@ -167,6 +174,8 @@ def wait_until(predicate, timeout, interval=0.05):
         now = time.time()
         MAX_GAP[0] = max(MAX_GAP[0], now - last)
         if now >= deadline:
+            if not quiet:
+                WAITS_RUN_OUT.append(timeout)
             return False
         time.sleep(interval)
         last = time.time()
@@ -174,7 +183,7 @@ def wait_until(predicate, timeout, interval=0.05):
 
 def sleep(seconds):
     """A pause that keeps the terminals read."""
-    wait_until(lambda: False, seconds)
+    wait_until(lambda: False, seconds, quiet=True)
 
 
 # --------------------------------------------------------------------- ledger
@@ -283,6 +292,19 @@ SCUTIL = {
     # itself, so whatever serve does meanwhile, it leaves nothing hanging
     'slow': lambda: f'/bin/sleep 2\n{exec_real(REAL_SCUTIL)}',
     'hangs': lambda: f'exec /bin/sleep {STALL}',
+}
+
+# The PID of the process the 'raw-control' ps makes up
+FAKE_PID = 99999
+
+PS = {
+    'real': lambda: exec_real(REAL_PS),
+    'fails': lambda: 'echo "ps: broken" >&2; exit 1',
+    'says-nothing': lambda: 'exit 0',
+    # The real list plus a made-up orphaned caddy whose command line carries
+    # raw control characters: macOS's ps shows them as ^[ and the like, so
+    # only a stand-in can check that serve does not pass them on
+    'raw-control': lambda: f"{q(REAL_PS)} \"$@\"\nprintf '{FAKE_PID} 1 {FAKE_PID} /opt/fake/caddy x\\033]0;owned\\007y\\n'",
 }
 
 # A stand-in for cloudflared that reproduces what serve's lifecycle depends
@@ -407,7 +429,7 @@ time.sleep(LIFETIME)
 """
 
 
-def write_shims(directory, ledger, caddy='real', lsof='real', scutil='real',
+def write_shims(directory, ledger, caddy='real', lsof='real', scutil='real', ps='real',
                 cloudflared='idle', address='ok', missing=(), lifetime=STUB_LIFETIME):
     """One shim per helper (ps and curl included) in `directory`.
     `cloudflared` is a stub mode ('idle', 'draining', 'stubborn') or 'real',
@@ -415,7 +437,7 @@ def write_shims(directory, ledger, caddy='real', lsof='real', scutil='real',
     `missing` get no shim, so serve cannot find them."""
     os.makedirs(directory, exist_ok=True)
     actions = {'caddy': CADDY[caddy](), 'lsof': LSOF[lsof](), 'scutil': SCUTIL[scutil](),
-               'ps': exec_real(REAL_PS), 'curl': exec_real(REAL_CURL)}
+               'ps': PS[ps](), 'curl': exec_real(REAL_CURL)}
     if cloudflared == 'real':
         actions['cloudflared'] = exec_real(REAL_CLOUDFLARED)
     else:
@@ -500,7 +522,7 @@ class Terminal:
         self.pump()
         return ANSI.sub('', self.raw[since:].decode(errors='replace')).replace('\r', '')
 
-    def expect(self, pattern, timeout, since=0):
+    def expect(self, pattern, timeout, since=0, quiet=False):
         found = []
 
         def check():
@@ -508,7 +530,7 @@ class Terminal:
             if m:
                 found.append(m)
             return bool(m)
-        wait_until(check, timeout, 0.02)
+        wait_until(check, timeout, 0.02, quiet)
         return found[0] if found else None
 
     def send(self, data):
